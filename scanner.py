@@ -15,6 +15,7 @@ TEST_LIBS=lib1,lib2 (opcional: libs concretas para la prueba; si no, se eligen 3
 Dependencias: requests, pillow
 """
 import gzip
+import hashlib
 import io
 import json
 import lzma
@@ -290,14 +291,15 @@ FRAME_MS = 100       # duración de cada frame de la animación
 ANIM_FORMAT = "webp"  # formato de las animaciones: "webp" o "gif"
 
 
-def garment_preview(decoders: dict, offsets: dict):
-    """
-    Arma la prenda COMPLETA: junta todas las piezas (lg, ch, ls...) de cada vista usando los
-    offsets del manifest. Filas: de pie (std), sentado (sit) y tumbado (lay); una columna por dirección.
-    Si la prenda tiene animación (varios frames), devuelve un GIF animado; si no, un PNG.
-    Devuelve (bytes, extensión) o None.
-    """
-    # acción -> dirección -> (tipo, id) -> {frame: (nombre_corto, nombre)}
+MAIN_ACTIONS = ("std", "sit", "lay", "wlk")   # de pie, sentado, tumbado, caminando
+OTHER_ORDER = ["wav", "drk", "crr", "spk", "respect", "sig", "blw", "sml", "sad", "agr", "srp",
+               "lag", "lsa", "lsm", "lsp", "lsr", "ley", "eyb"]
+ROWS_PER_SHEET = 5      # filas (estados) por hoja en las hojas de "otros estados"
+MAX_EXTRA_SHEETS = 4    # máx. hojas extra (Discord admite 10 adjuntos por mensaje)
+
+
+def _collect_views(decoders: dict, offsets: dict) -> dict:
+    """acción -> dirección -> (tipo, id) -> {frame: (nombre_corto, nombre)}"""
     views = {}
     for name in decoders:
         m = ASSET_RE.search(name)
@@ -306,58 +308,58 @@ def garment_preview(decoders: dict, offsets: dict):
         action, ptype, pid = m.group(1), m.group(2), int(m.group(3))
         direction, frame = int(m.group(4)), int(m.group(5))
         views.setdefault(action, {}).setdefault(direction, {}).setdefault((ptype, pid), {})[frame] = (m.group(0), name)
+    return views
 
-    actions = [a for a in ("std", "sit", "lay") if a in views] or sorted(views)[:1]
-    rows = []  # cada fila: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...]
-    for action in actions:
-        row = []
-        for direction in sorted(views[action]):
-            parts = views[action][direction]
-            frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
-            order = sorted(parts, key=lambda k: (Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER), k[1], k[0]))
-            composed = []  # un lienzo (con su posición) por frame
-            for f in frames:
-                placed = []
-                for key in order:
-                    pframes = parts[key]
-                    entry = pframes.get(f) or pframes.get(0) or pframes[min(pframes)]
-                    short, name = entry
-                    try:
-                        img = decoders[name]()
-                    except Exception as exc:
-                        print(f"  no se pudo decodificar {name}: {exc}", file=sys.stderr)
-                        continue
-                    ox, oy = offsets[short]
-                    placed.append((img, -ox, -oy))  # esquina superior izquierda = (-offset)
-                if placed:
-                    composed.append(placed)
-            if not composed:
-                continue
-            # un mismo recuadro para todos los frames, para que la animación no "salte"
-            x0 = min(x for pl in composed for _i, x, _y in pl)
-            y0 = min(y for pl in composed for _i, _x, y in pl)
-            x1 = max(x + i.width for pl in composed for i, x, _y in pl)
-            y1 = max(y + i.height for pl in composed for i, _x, y in pl)
-            canvases, boxes = [], []
-            for pl in composed:
-                tile = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
-                for img, x, y in pl:
-                    tile.alpha_composite(img, (x - x0, y - y0))
-                canvases.append(tile)
-                if tile.getbbox():
-                    boxes.append(tile.getbbox())
-            if not boxes:
-                continue
-            crop = (min(b[0] for b in boxes), min(b[1] for b in boxes),
-                    max(b[2] for b in boxes), max(b[3] for b in boxes))
-            if (crop[2] - crop[0]) * (crop[3] - crop[1]) <= 1:  # marcador de 1 píxel
-                continue
-            row.append((f"{action} {direction}", [c.crop(crop) for c in canvases]))
-        if row:
-            rows.append(row)
-    if not rows:
-        return None
 
+def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict):
+    """Fila de un estado: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...] (una por dirección)."""
+    row = []
+    for direction in sorted(dirs):
+        parts = dirs[direction]
+        frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
+        order = sorted(parts, key=lambda k: (Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER), k[1], k[0]))
+        composed = []  # un lienzo (con su posición) por frame
+        for f in frames:
+            placed = []
+            for key in order:
+                pframes = parts[key]
+                short, name = pframes.get(f) or pframes.get(0) or pframes[min(pframes)]
+                try:
+                    img = decoders[name]()
+                except Exception as exc:
+                    print(f"  no se pudo decodificar {name}: {exc}", file=sys.stderr)
+                    continue
+                ox, oy = offsets[short]
+                placed.append((img, -ox, -oy))  # esquina superior izquierda = (-offset)
+            if placed:
+                composed.append(placed)
+        if not composed:
+            continue
+        # un mismo recuadro para todos los frames, para que la animación no "salte"
+        x0 = min(x for pl in composed for _i, x, _y in pl)
+        y0 = min(y for pl in composed for _i, _x, y in pl)
+        x1 = max(x + i.width for pl in composed for i, x, _y in pl)
+        y1 = max(y + i.height for pl in composed for i, _x, y in pl)
+        canvases, boxes = [], []
+        for pl in composed:
+            tile = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+            for img, x, y in pl:
+                tile.alpha_composite(img, (x - x0, y - y0))
+            canvases.append(tile)
+            if tile.getbbox():
+                boxes.append(tile.getbbox())
+        if not boxes:
+            continue
+        crop = (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                max(b[2] for b in boxes), max(b[3] for b in boxes))
+        if (crop[2] - crop[0]) * (crop[3] - crop[1]) <= 1:  # marcador de 1 píxel
+            continue
+        row.append((f"{action} {direction}", [c.crop(crop) for c in canvases]))
+    return row
+
+
+def _render_sheet(rows: list):
+    """Dibuja una hoja con las filas dadas. PNG si es fija, WebP/GIF animado si alguna fila se mueve."""
     pad, label_h, min_cell = 8, 22, 64
     biggest = max(max(t[0].width, t[0].height) for r in rows for _l, t in r)
     scale = 6 if biggest <= 24 else 5 if biggest <= 40 else 4 if biggest <= 70 else 3
@@ -413,6 +415,46 @@ def garment_preview(decoders: dict, offsets: dict):
     return buf.getvalue(), "gif"
 
 
+def garment_previews(decoders: dict, offsets: dict) -> list:
+    """
+    Arma la prenda COMPLETA (todas las piezas unidas con los offsets del manifest) en TODOS sus estados,
+    se muevan o no. Devuelve una lista de (bytes, extensión, sufijo_del_archivo):
+      - hoja principal: de pie (std), sentado (sit), tumbado (lay) y caminando (wlk);
+      - hojas "otros estados": saludar, beber, hablar, expresiones... (de a 5 estados por hoja).
+    Los estados con varios frames se animan (WebP/GIF); los fijos salen como imagen fija.
+    Los estados con imágenes idénticas a otro ya incluido se omiten.
+    """
+    views = _collect_views(decoders, offsets)
+    main = [a for a in MAIN_ACTIONS if a in views]
+    others = sorted((a for a in views if a not in MAIN_ACTIONS),
+                    key=lambda a: (OTHER_ORDER.index(a) if a in OTHER_ORDER else len(OTHER_ORDER), a))
+    seen = set()
+
+    def unique(row):
+        """Descarta estados idénticos a otro ya incluido (p. ej. 'hablar' igual que 'de pie')."""
+        sig = tuple((label.split()[-1], tuple(hashlib.md5(f.tobytes()).hexdigest() for f in frames))
+                    for label, frames in row)
+        if not row or sig in seen:
+            return False
+        seen.add(sig)
+        return True
+
+    main_rows = [r for r in (_build_row(a, views[a], decoders, offsets) for a in main) if unique(r)]
+    other_rows = [r for r in (_build_row(a, views[a], decoders, offsets) for a in others) if unique(r)]
+
+    groups = []
+    if main_rows:
+        groups.append((main_rows, ""))
+    chunks = [other_rows[i:i + ROWS_PER_SHEET] for i in range(0, len(other_rows), ROWS_PER_SHEET)]
+    for n, chunk in enumerate(chunks[:MAX_EXTRA_SHEETS], start=1):
+        groups.append((chunk, "_otros" if n == 1 else f"_otros{n}"))
+    out = []
+    for rows, suffix in groups:
+        data, ext = _render_sheet(rows)
+        out.append((data, ext, suffix))
+    return out
+
+
 def pick_preview_names(names: list) -> list:
     """Elige las imágenes más representativas: tamaño grande, de pie, mirando a la dirección 2."""
     patterns = [
@@ -453,23 +495,23 @@ def build_sheet(images: list):
     return buf.getvalue()
 
 
-def lib_preview_png(swf_url: str):
-    """Descarga el .swf de la lib y devuelve un PNG con sus imágenes (o None)."""
+def lib_previews(swf_url: str) -> list:
+    """Descarga el .swf de la lib y devuelve [(bytes, extensión, sufijo)] con sus imágenes ([] si no hay)."""
     r = requests.get(swf_url, headers=HEADERS, timeout=60)
     if r.status_code == 404:
         print(f"  sin .swf en {swf_url}")
-        return None, None
+        return []
     r.raise_for_status()
     if len(r.content) > MAX_SWF_BYTES:
         print(f"  .swf demasiado grande: {swf_url}")
-        return None, None
+        return []
     decoders, offsets = read_swf(r.content)
     if not decoders:
-        return None, None
-    result = None
+        return []
+    result = []
     try:
         if offsets:
-            result = garment_preview(decoders, offsets)
+            result = garment_previews(decoders, offsets)
     except Exception as exc:
         print(f"  error armando la prenda: {exc}", file=sys.stderr)
     if result:
@@ -481,20 +523,21 @@ def lib_preview_png(swf_url: str):
             images.append(decoders[name]())
         except Exception as exc:
             print(f"  no se pudo decodificar {name}: {exc}", file=sys.stderr)
-    return (build_sheet(images), "png") if images else (None, None)
+    return [(build_sheet(images), "png", "")] if images else []
 
 
 # ----------------------------------------------------------------- Discord
-def send_discord(text: str, png: bytes = None, filename: str = "ropa.png", mime: str = "image/png") -> None:
-    if png and len(png) > MAX_PNG_BYTES:
-        png = None  # demasiado pesada para Discord: se avisa solo con texto
+def send_discord(text: str, attachments: list = None) -> None:
+    """Envía un mensaje al webhook. attachments = [(bytes, nombre_de_archivo, mime), ...]"""
+    attachments = [x for x in (attachments or []) if len(x[0]) <= MAX_PNG_BYTES][:10]
     if not WEBHOOK:
-        print("Falta DISCORD_WEBHOOK_URL; mensaje no enviado:", text, "(con imagen)" if png else "")
+        print("Falta DISCORD_WEBHOOK_URL; mensaje no enviado:", text, f"(+{len(attachments)} imagen/es)")
         return
     for _ in range(3):
-        if png:
-            r = requests.post(WEBHOOK, data={"content": text},
-                              files={"file": (filename, io.BytesIO(png), mime)}, timeout=60)
+        if attachments:
+            files = {f"files[{i}]": (name, io.BytesIO(data), mime)
+                     for i, (data, name, mime) in enumerate(attachments)}
+            r = requests.post(WEBHOOK, data={"content": text}, files=files, timeout=120)
         else:
             r = requests.post(WEBHOOK, json={"content": text}, timeout=TIMEOUT)
         if r.status_code == 429:  # límite de Discord: esperar y reintentar
@@ -563,13 +606,14 @@ def main() -> int:
 
     for n, (lib_id, info) in enumerate(sorted(found.items())):
         text = f"👕 Se ha encontrado la siguiente ropa **{lib_id}** — {', '.join(info['hotels'])}"
-        png, ext = None, "png"
+        attachments = []
         try:
             if n < MAX_PREVIEWS:
-                png, ext = lib_preview_png(f"{info['url']}{lib_id}.swf")
+                for data, ext, suffix in lib_previews(f"{info['url']}{lib_id}.swf"):
+                    attachments.append((data, f"{lib_id}{suffix}.{ext}", MIME.get(ext, "application/octet-stream")))
         except Exception as exc:  # si falla la imagen, igual se avisa con texto
             print(f"[{lib_id}] error obteniendo imágenes: {exc}", file=sys.stderr)
-        send_discord(text, png, f"{lib_id}.{ext}", MIME.get(ext, "application/octet-stream"))
+        send_discord(text, attachments)
 
     if not test_mode:
         save_state(state)
