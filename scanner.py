@@ -160,7 +160,7 @@ def main() -> int:
 
     if found:
         lines = [
-            f"Se ha encontrado la siguiente ropa **{lib_id}** — {', '.join(hotels)}"
+            f"🔴🆕 Se ha encontrado la siguiente ropa **{lib_id}** — {', '.join(hotels)}"
             for lib_id, hotels in sorted(found.items())
         ]
         send_discord(lines)
