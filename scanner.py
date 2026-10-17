@@ -118,10 +118,13 @@ def send_discord(lines: list) -> None:
 # ----------------------------------------------------------------- principal
 def main() -> int:
     state = load_state()
+    test_mode = os.environ.get("TEST_MODE") == "true"  # prueba: simula 2 libs nuevas en habbo.es
     cache = {}       # base_url -> set de lib ids (evita descargar dos veces)
     found = {}       # lib id -> [hoteles donde se encontró]
 
     for hotel, ext_url in HOTELS.items():
+        if test_mode and hotel != "habbo.es":
+            continue
         try:
             new_url = get_flash_client_url(ext_url)
         except Exception as exc:  # un hotel caído no debe parar el resto
@@ -131,7 +134,7 @@ def main() -> int:
             print(f"[{hotel}] sin flash.client.url")
             continue
 
-        if new_url == state["urls"].get(hotel):
+        if new_url == state["urls"].get(hotel) and not test_mode:
             continue  # variable sin cambios -> no se busca nada
 
         print(f"[{hotel}] flash.client.url cambió -> {new_url}")
@@ -144,10 +147,14 @@ def main() -> int:
             continue  # no se guarda la URL; se reintenta en la próxima ejecución
 
         old_ids = load_snapshot(hotel)
+        if test_mode and old_ids:
+            old_ids = set(sorted(old_ids)[:-2])  # "olvida" 2 libs para simular que son nuevas
         if old_ids is not None:  # si es la primera vez, solo se guarda la línea base
             for lib_id in sorted(new_ids - old_ids):
                 found.setdefault(lib_id, []).append(hotel)
 
+        if test_mode:
+            continue  # en prueba no se toca el estado real
         save_snapshot(hotel, new_ids)
         state["urls"][hotel] = new_url
 
@@ -158,7 +165,8 @@ def main() -> int:
         ]
         send_discord(lines)
 
-    save_state(state)
+    if not test_mode:
+        save_state(state)
     return 0
 
 
