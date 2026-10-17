@@ -10,7 +10,8 @@ Flujo:
  4. Por cada lib nueva descarga <flash.client.url><lib>.swf, extrae sus imágenes
     y envía a Discord: "Se ha encontrado la siguiente ropa XX" + dominio(s) + imagen.
 
-Variables de entorno: DISCORD_WEBHOOK_URL (obligatoria), TEST_MODE=true (prueba)
+Variables de entorno: DISCORD_WEBHOOK_URL (obligatoria), TEST_MODE=true (prueba),
+TEST_LIBS=lib1,lib2 (opcional: libs concretas para la prueba; si no, se eligen 3 al azar)
 Dependencias: requests, pillow
 """
 import gzip
@@ -19,6 +20,7 @@ import json
 import lzma
 import math
 import os
+import random
 import re
 import struct
 import sys
@@ -52,6 +54,7 @@ MAX_SWF_BYTES = 40 * 1024 * 1024
 MAX_IMAGES_IN_SHEET = 24
 MAX_PREVIEWS = 30            # máx. prendas con imagen por ejecución (el resto, solo texto)
 MAX_PNG_BYTES = 8 * 1024 * 1024
+MIME = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
 
 # ----------------------------------------------------------------- estado
@@ -283,7 +286,8 @@ def _font(size: int):
 
 
 MAX_FRAMES = 12      # máx. frames de animación por vista
-FRAME_MS = 100       # duración de cada frame en el GIF
+FRAME_MS = 100       # duración de cada frame de la animación
+ANIM_FORMAT = "webp"  # formato de las animaciones: "webp" o "gif"
 
 
 def garment_preview(decoders: dict, offsets: dict):
@@ -392,6 +396,16 @@ def garment_preview(decoders: dict, offsets: dict):
     if n_frames == 1:
         render(0).save(buf, "PNG", optimize=True)
         return buf.getvalue(), "png"
+    if ANIM_FORMAT == "webp":
+        try:
+            frames_out = [render(i).convert("RGB") for i in range(n_frames)]
+            frames_out[0].save(buf, "WEBP", save_all=True, append_images=frames_out[1:],
+                               duration=FRAME_MS, loop=0, lossless=True, quality=100, method=4)
+            return buf.getvalue(), "webp"
+        except Exception as exc:  # Pillow sin soporte de WebP animado -> se usa GIF
+            print(f"  WebP animado no disponible ({exc}); se usa GIF", file=sys.stderr)
+            buf = io.BytesIO()
+    # GIF (formato de respaldo)
     frames_out = [render(i).convert("RGB").convert("P", palette=Image.ADAPTIVE, colors=256)
                   for i in range(n_frames)]
     frames_out[0].save(buf, "GIF", save_all=True, append_images=frames_out[1:],
@@ -499,7 +513,7 @@ def send_discord(text: str, png: bytes = None, filename: str = "ropa.png", mime:
 # ----------------------------------------------------------------- principal
 def main() -> int:
     state = load_state()
-    test_mode = os.environ.get("TEST_MODE") == "true"  # prueba: simula 2 libs nuevas en habbo.es
+    test_mode = os.environ.get("TEST_MODE") == "true"  # prueba: simula libs nuevas en habbo.es
     cache = {}       # base_url -> set de lib ids (evita descargar dos veces)
     found = {}       # lib id -> {"hotels": [...], "url": base_url}
 
@@ -528,8 +542,15 @@ def main() -> int:
             continue  # no se guarda la URL; se reintenta en la próxima ejecución
 
         old_ids = load_snapshot(hotel)
-        if test_mode and old_ids:
-            old_ids = set(sorted(old_ids)[:-2])  # "olvida" 2 libs para simular que son nuevas
+        if test_mode:
+            # Prueba: "olvida" algunas libs para simular que son nuevas.
+            wanted = [x for x in re.split(r"[,\s]+", os.environ.get("TEST_LIBS", "")) if x]
+            missing = [x for x in wanted if x not in new_ids]
+            if missing:
+                print(f"[prueba] libs que no existen en el figuremap: {', '.join(missing)}")
+            chosen = [x for x in wanted if x in new_ids] or random.sample(sorted(new_ids), min(3, len(new_ids)))
+            print(f"[prueba] libs simuladas como nuevas: {', '.join(chosen)}")
+            old_ids = set(new_ids) - set(chosen)
         if old_ids is not None:  # si es la primera vez, solo se guarda la línea base
             for lib_id in sorted(new_ids - old_ids):
                 entry = found.setdefault(lib_id, {"hotels": [], "url": new_url})
@@ -548,7 +569,7 @@ def main() -> int:
                 png, ext = lib_preview_png(f"{info['url']}{lib_id}.swf")
         except Exception as exc:  # si falla la imagen, igual se avisa con texto
             print(f"[{lib_id}] error obteniendo imágenes: {exc}", file=sys.stderr)
-        send_discord(text, png, f"{lib_id}.{ext}", "image/gif" if ext == "gif" else "image/png")
+        send_discord(text, png, f"{lib_id}.{ext}", MIME.get(ext, "application/octet-stream"))
 
     if not test_mode:
         save_state(state)
