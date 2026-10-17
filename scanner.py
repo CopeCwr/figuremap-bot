@@ -31,7 +31,7 @@ import zlib
 from pathlib import Path
 
 import requests
-from PIL import Image
+from PIL import Image, ImageOps
 
 HOTELS = {
     "sandbox.habbo.com": "https://sandbox.habbo.com/gamedata/external_variables/1",
@@ -294,8 +294,13 @@ ANIM_FORMAT = "webp"  # formato de las animaciones: "webp" o "gif"
 MAIN_ACTIONS = ("std", "sit", "lay", "wlk")   # de pie, sentado, tumbado, caminando
 OTHER_ORDER = ["wav", "drk", "crr", "spk", "respect", "sig", "blw", "sml", "sad", "agr", "srp",
                "lag", "lsa", "lsm", "lsp", "lsr", "ley", "eyb"]
-ROWS_PER_SHEET = 5      # filas (estados) por hoja en las hojas de "otros estados"
-MAX_EXTRA_SHEETS = 4    # máx. hojas extra (Discord admite 10 adjuntos por mensaje)
+LAY_ACTIONS = {"lag", "ley", "lsa", "lsm", "lsp", "lsr"}   # expresiones en pose tumbado
+HEAD_TYPES = {"hd", "fc", "ey", "hr", "hrb", "ha", "he", "ea", "fa"}   # no cambian al sentarse
+MIRROR_OF = {4: 2, 5: 1, 6: 0}   # direcciones que Habbo dibuja como espejo de otra
+MIRROR_AXIS2 = 67                # 2 x el eje central del avatar (x ≈ 33,5)
+LAY_SHIFT = (-64, -160)   # esas piezas usan otro origen: con este ajuste coinciden con la pose "lay"
+SHEET_MAX_H = 1500      # alto aproximado máx. (px) de cada hoja de "otros estados"
+MAX_EXTRA_SHEETS = 6    # máx. hojas extra (Discord admite 10 adjuntos por mensaje)
 
 
 def _collect_views(decoders: dict, offsets: dict) -> dict:
@@ -311,11 +316,32 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
     return views
 
 
-def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict):
-    """Fila de un estado: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...] (una por dirección)."""
+def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
+               fill_types=None):
+    """
+    Fila de un estado: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...] (una por dirección).
+    Los gestos (saludar, beber, hablar...) solo traen las piezas que cambian (p. ej. una manga);
+    `base` son las piezas de "de pie" (std): las que el gesto no trae se completan desde ahí,
+    para ver la prenda entera y no solo la pieza suelta.
+    `fill_types`: si se indica, solo esos tipos de pieza se completan desde la base.
+    `shift` corrige el origen de las piezas propias del estado (las expresiones tumbado vienen
+    desplazadas respecto a la pose "lay").
+    """
     row = []
     for direction in sorted(dirs):
-        parts = dirs[direction]
+        parts = dict(dirs[direction])
+        own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
+        flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
+        if base:
+            have = {t for t, _pid in parts}
+            src_dir, mirror = direction, False
+            if direction not in base and MIRROR_OF.get(direction) in base:
+                src_dir, mirror = MIRROR_OF[direction], True  # Habbo: 4, 5, 6 = espejo de 2, 1, 0
+            for key, fr in base.get(src_dir, {}).items():
+                if key[0] not in have and (fill_types is None or key[0] in fill_types):
+                    parts[key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
+                    if mirror:
+                        flipped.add(key)
         frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
         order = sorted(parts, key=lambda k: (Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER), k[1], k[0]))
         composed = []  # un lienzo (con su posición) por frame
@@ -330,7 +356,12 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict):
                     print(f"  no se pudo decodificar {name}: {exc}", file=sys.stderr)
                     continue
                 ox, oy = offsets[short]
-                placed.append((img, -ox, -oy))  # esquina superior izquierda = (-offset)
+                if key in flipped:  # espejo respecto al eje central del avatar
+                    img = ImageOps.mirror(img)
+                    placed.append((img, MIRROR_AXIS2 - (-ox) - img.width, -oy))
+                    continue
+                dx, dy = shift if key in own else (0, 0)
+                placed.append((img, -ox + dx, -oy + dy))  # esquina superior izquierda = (-offset)
             if placed:
                 composed.append(placed)
         if not composed:
@@ -420,7 +451,7 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
     Arma la prenda COMPLETA (todas las piezas unidas con los offsets del manifest) en TODOS sus estados,
     se muevan o no. Devuelve una lista de (bytes, extensión, sufijo_del_archivo):
       - hoja principal: de pie (std), sentado (sit), tumbado (lay) y caminando (wlk);
-      - hojas "otros estados": saludar, beber, hablar, expresiones... (de a 5 estados por hoja).
+      - hojas "otros estados": saludar, beber, hablar, expresiones... (agrupados por altura de hoja).
     Los estados con varios frames se animan (WebP/GIF); los fijos salen como imagen fija.
     Los estados con imágenes idénticas a otro ya incluido se omiten.
     """
@@ -439,13 +470,41 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
         seen.add(sig)
         return True
 
-    main_rows = [r for r in (_build_row(a, views[a], decoders, offsets) for a in main) if unique(r)]
-    other_rows = [r for r in (_build_row(a, views[a], decoders, offsets) for a in others) if unique(r)]
+    std, lay = views.get("std"), views.get("lay")
+
+    def row_of(a):
+        # std y lay son poses completas. Las expresiones tumbado (lag, lsp...) se completan con "lay";
+        # el resto de gestos (saludar, beber...) se completa con las piezas de "de pie".
+        shift, fill = (0, 0), None
+        if a in ("std", "lay"):
+            base = None
+        elif a in LAY_ACTIONS:
+            base, shift = lay, LAY_SHIFT
+        else:
+            base = std
+            if a == "sit":  # sentado cambia el cuerpo: solo la cabeza se completa desde "de pie"
+                fill = HEAD_TYPES
+        return _build_row(a, views[a], decoders, offsets, base, shift, fill)
+
+    main_rows = [r for r in (row_of(a) for a in main) if unique(r)]
+    other_rows = [r for r in (row_of(a) for a in others) if unique(r)]
 
     groups = []
     if main_rows:
         groups.append((main_rows, ""))
-    chunks = [other_rows[i:i + ROWS_PER_SHEET] for i in range(0, len(other_rows), ROWS_PER_SHEET)]
+    chunks, cur, cur_h = [], [], 0
+    for r in other_rows:
+        row_h = max(t[0].height for _l, t in r) * 3 + 30
+        if cur and (cur_h + row_h > SHEET_MAX_H or len(cur) >= 8):
+            chunks.append(cur)
+            cur, cur_h = [], 0
+        cur.append(r)
+        cur_h += row_h
+    if cur:
+        chunks.append(cur)
+    if len(chunks) > MAX_EXTRA_SHEETS:
+        print(f"  aviso: {len(chunks) - MAX_EXTRA_SHEETS} hoja(s) de estados no se envían (límite de adjuntos)",
+              file=sys.stderr)
     for n, chunk in enumerate(chunks[:MAX_EXTRA_SHEETS], start=1):
         groups.append((chunk, "_otros" if n == 1 else f"_otros{n}"))
     out = []
