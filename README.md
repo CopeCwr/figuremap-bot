@@ -1,0 +1,1 @@
+# figuremap-bot
