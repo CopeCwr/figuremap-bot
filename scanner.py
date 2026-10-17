@@ -195,33 +195,174 @@ def decode_jpeg(tag: bytes, with_alpha: bool) -> Image.Image:
     return img
 
 
-def read_symbols(tag: bytes) -> dict:
+def read_symbols(tag: bytes) -> list:
+    """SymbolClass / ExportAssets -> [(id_del_bitmap, nombre)]. Varios nombres pueden compartir bitmap."""
     n = struct.unpack_from("<H", tag, 0)[0]
-    pos, out = 2, {}
+    pos, out = 2, []
     for _ in range(n):
         cid = struct.unpack_from("<H", tag, pos)[0]
         end = tag.index(b"\x00", pos + 2)
-        out[cid] = tag[pos + 2:end].decode("utf-8", "ignore")
+        out.append((cid, tag[pos + 2:end].decode("utf-8", "ignore")))
         pos = end + 1
     return out
 
 
-def swf_images(data: bytes) -> dict:
-    """Devuelve {nombre_del_símbolo: función que decodifica la imagen}."""
-    bitmaps, names = {}, {}
+def parse_offsets(manifest: bytes) -> dict:
+    """Lee el manifest.xml del SWF -> {nombre_corto: (x, y)} con el offset de cada imagen."""
+    out = {}
+    try:
+        root = ET.fromstring(manifest.strip(b"\x00").strip())
+    except ET.ParseError:
+        return out
+    for asset in root.iter("asset"):
+        for param in asset.iter("param"):
+            if param.get("key") == "offset":
+                try:
+                    x, y = (int(v) for v in param.get("value", "").split(","))
+                    out[asset.get("name")] = (x, y)
+                except ValueError:
+                    pass
+    return out
+
+
+def read_swf(data: bytes):
+    """
+    Devuelve ({nombre: función que decodifica la imagen}, {nombre_corto: (x, y)}).
+    Un mismo bitmap puede tener muchos nombres (Flash reutiliza imágenes idénticas).
+    """
+    raw, pairs, manifest = {}, [], b""
     for code, tag in iter_tags(swf_body(data)):
         cid = struct.unpack_from("<H", tag, 0)[0] if len(tag) >= 2 else None
-        if code == 20:
-            bitmaps[cid] = lambda t=tag: decode_lossless(t, False)
-        elif code == 36:
-            bitmaps[cid] = lambda t=tag: decode_lossless(t, True)
-        elif code == 21:
-            bitmaps[cid] = lambda t=tag: decode_jpeg(t, False)
-        elif code == 35:
-            bitmaps[cid] = lambda t=tag: decode_jpeg(t, True)
-        elif code in (76, 56):  # SymbolClass / ExportAssets (misma estructura: id + nombre)
-            names.update(read_symbols(tag))
-    return {names.get(cid, f"img_{cid}"): fn for cid, fn in bitmaps.items()}
+        if code in (20, 36, 21, 35):
+            raw[cid] = (code, tag)
+        elif code in (76, 56):  # SymbolClass / ExportAssets
+            pairs += read_symbols(tag)
+        elif code == 87 and b"<manifest" in tag[:300]:  # DefineBinaryData con el manifest
+            manifest = tag[6:]
+
+    cache = {}
+
+    def make(cid):
+        def get():
+            if cid not in cache:
+                code, tag = raw[cid]
+                cache[cid] = (decode_lossless(tag, code == 36) if code in (20, 36)
+                              else decode_jpeg(tag, code == 35))
+            return cache[cid]
+        return get
+
+    decoders = {name: make(cid) for cid, name in pairs if cid in raw}
+    named = {cid for cid, _ in pairs}
+    for cid in raw:
+        if cid not in named:
+            decoders[f"img_{cid}"] = make(cid)
+    return decoders, parse_offsets(manifest)
+
+
+# Nombre de cada imagen de ropa: h_<acción>_<tipo>_<id>_<dirección>_<frame>
+ASSET_RE = re.compile(r"h_([a-z]+)_([a-z]+)_(\d+)_(\d)_(\d+)$")
+# Orden de dibujo aproximado por tipo de pieza (de atrás hacia delante)
+Z_ORDER = ["bd", "lh", "rh", "lg", "sh", "ch", "cc", "ca", "ls", "rs", "lc", "rc",
+           "wa", "cp", "ea", "fa", "ey", "hrb", "hr", "he", "ha"]
+BG = (200, 202, 208, 255)
+
+
+def _font(size: int):
+    try:
+        from PIL import ImageFont
+        return ImageFont.load_default(size=size)
+    except Exception:
+        from PIL import ImageFont
+        return ImageFont.load_default()
+
+
+def garment_preview(decoders: dict, offsets: dict):
+    """
+    Arma la prenda COMPLETA: junta todas las piezas (lg, ch, ls...) de cada vista usando los
+    offsets del manifest. Filas: de pie (std), sentado (sit) y tumbado (lay); una columna por dirección.
+    """
+    views = {}  # acción -> dirección -> [(orden, id, nombre_corto, nombre)]
+    for name in decoders:
+        m = ASSET_RE.search(name)
+        if not m or m.group(5) != "0" or m.group(0) not in offsets:
+            continue
+        action, ptype, pid, direction = m.group(1), m.group(2), int(m.group(3)), int(m.group(4))
+        order = Z_ORDER.index(ptype) if ptype in Z_ORDER else len(Z_ORDER)
+        views.setdefault(action, {}).setdefault(direction, []).append((order, pid, m.group(0), name))
+
+    actions = [a for a in ("std", "sit", "lay") if a in views] or sorted(views)[:1]
+    rows = []  # cada fila: [(etiqueta, [(imagen, x, y), ...]), ...]
+    for action in actions:
+        row = []
+        for direction in sorted(views[action]):
+            placed = []
+            for _order, _pid, short, name in sorted(views[action][direction]):
+                try:
+                    img = decoders[name]()
+                except Exception as exc:
+                    print(f"  no se pudo decodificar {name}: {exc}", file=sys.stderr)
+                    continue
+                ox, oy = offsets[short]
+                placed.append((img, -ox, -oy))  # esquina superior izquierda = (-offset)
+            if placed:
+                row.append((f"{action} {direction}", placed))
+        if row:
+            rows.append(row)
+    if not rows:
+        return None
+
+    # Cada vista se arma sobre su propio lienzo y se recorta al contenido
+    # (así los objetos flotantes, como mascotas o cosas en la mano, no dejan huecos enormes).
+    tile_rows = []
+    for row in rows:
+        tiles = []
+        for label, placed in row:
+            x0 = min(x for _i, x, _y in placed)
+            y0 = min(y for _i, _x, y in placed)
+            x1 = max(x + i.width for i, x, _y in placed)
+            y1 = max(y + i.height for i, _x, y in placed)
+            tile = Image.new("RGBA", (x1 - x0, y1 - y0), (0, 0, 0, 0))
+            for img, x, y in placed:
+                tile.alpha_composite(img, (x - x0, y - y0))
+            box = tile.getbbox()
+            if box:
+                tiles.append((label, tile.crop(box)))
+        if tiles:
+            tile_rows.append(tiles)
+    if not tile_rows:
+        return None
+
+    pad, label_h, min_cell = 8, 22, 64
+    scale = 3
+
+    def row_width(tiles, sc):
+        return sum(max(t.width * sc, min_cell) + pad for _l, t in tiles) + pad
+
+    while scale > 1 and max(row_width(r, scale) for r in tile_rows) > 1800:
+        scale -= 1
+
+    width = max(row_width(r, scale) for r in tile_rows)
+    heights = [max(t.height * scale for _l, t in r) + label_h + pad for r in tile_rows]
+    sheet = Image.new("RGBA", (width, sum(heights) + pad), BG)
+    from PIL import ImageDraw
+    draw = ImageDraw.Draw(sheet)
+    font = _font(14)
+
+    y_cursor = pad
+    for tiles, row_h in zip(tile_rows, heights):
+        x_cursor = pad
+        tallest = max(t.height * scale for _l, t in tiles)
+        for label, tile in tiles:
+            cell_w = max(tile.width * scale, min_cell)
+            big = tile.resize((tile.width * scale, tile.height * scale), Image.NEAREST)
+            sheet.alpha_composite(big, (x_cursor + (cell_w - big.width) // 2, y_cursor))
+            draw.text((x_cursor + 2, y_cursor + tallest + 2), label, fill=(60, 60, 70, 255), font=font)
+            x_cursor += cell_w + pad
+        y_cursor += row_h
+
+    buf = io.BytesIO()
+    sheet.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
 
 
 def pick_preview_names(names: list) -> list:
@@ -274,9 +415,18 @@ def lib_preview_png(swf_url: str):
     if len(r.content) > MAX_SWF_BYTES:
         print(f"  .swf demasiado grande: {swf_url}")
         return None
-    decoders = swf_images(r.content)
+    decoders, offsets = read_swf(r.content)
     if not decoders:
         return None
+    png = None
+    try:
+        if offsets:
+            png = garment_preview(decoders, offsets)
+    except Exception as exc:
+        print(f"  error armando la prenda: {exc}", file=sys.stderr)
+    if png:
+        return png
+    # Plan B: hoja con las imágenes sueltas más representativas
     images = []
     for name in pick_preview_names(list(decoders)):
         try:
