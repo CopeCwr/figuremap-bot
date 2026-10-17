@@ -1,0 +1,39 @@
+name: Comando ropa (Discord)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: comando-ropa
+  cancel-in-progress: false
+
+jobs:
+  responder:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests pillow
+
+      - name: Responder a los nombres escritos en el canal
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_COMMAND_CHANNEL_ID: ${{ secrets.DISCORD_COMMAND_CHANNEL_ID }}
+        run: python comando.py
+
+      - name: Guardar estado
+        if: always()
+        run: |
+          git config user.name "figuremap-bot"
+          git config user.email "figuremap-bot@users.noreply.github.com"
+          git add state/comando.json
+          git diff --cached --quiet || (git commit -m "Actualizar estado del comando" && git pull --rebase && git push)
