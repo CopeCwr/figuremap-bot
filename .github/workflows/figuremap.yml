@@ -6,9 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: "Modo prueba: simula 2 libs nuevas en habbo.es y envía el aviso (con imágenes) a Discord"
+        description: "Modo prueba: simula libs nuevas en habbo.es y envía el aviso (con imágenes) a Discord"
         type: boolean
         default: false
+      libs:
+        description: "Solo para la prueba (opcional): libs concretas separadas por coma. Vacío = 3 al azar"
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -33,6 +37,7 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           TEST_MODE: ${{ inputs.test }}
+          TEST_LIBS: ${{ inputs.libs }}
         run: python scanner.py
 
       - name: Guardar estado
