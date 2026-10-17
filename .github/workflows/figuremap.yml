@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test:
-        description: "Modo prueba: simula 2 libs nuevas en habbo.es y envía el aviso a Discord"
+        description: "Modo prueba: simula 2 libs nuevas en habbo.es y envía el aviso (con imágenes) a Discord"
         type: boolean
         default: false
 
@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install requests
+      - run: pip install requests pillow
 
       - name: Ejecutar escáner
         env:
