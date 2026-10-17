@@ -50,6 +50,8 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; HabboFiguremapBot/1.0)"}
 TIMEOUT = 30
 MAX_SWF_BYTES = 40 * 1024 * 1024
 MAX_IMAGES_IN_SHEET = 24
+MAX_PREVIEWS = 30            # máx. prendas con imagen por ejecución (el resto, solo texto)
+MAX_PNG_BYTES = 8 * 1024 * 1024
 
 
 # ----------------------------------------------------------------- estado
@@ -213,6 +215,10 @@ def parse_offsets(manifest: bytes) -> dict:
     try:
         root = ET.fromstring(manifest.strip(b"\x00").strip())
     except ET.ParseError:
+        text = manifest.decode("latin-1", "ignore")
+        for name, x, y in re.findall(
+                r'<asset name="([^"]+)"[^>]*>\s*<param key="offset" value="(-?\d+),(-?\d+)"', text):
+            out[name] = (int(x), int(y))
         return out
     for asset in root.iter("asset"):
         for param in asset.iter("param"):
@@ -262,8 +268,8 @@ def read_swf(data: bytes):
 # Nombre de cada imagen de ropa: h_<acción>_<tipo>_<id>_<dirección>_<frame>
 ASSET_RE = re.compile(r"h_([a-z]+)_([a-z]+)_(\d+)_(\d)_(\d+)$")
 # Orden de dibujo aproximado por tipo de pieza (de atrás hacia delante)
-Z_ORDER = ["bd", "lh", "rh", "lg", "sh", "ch", "cc", "ca", "ls", "rs", "lc", "rc",
-           "wa", "cp", "ea", "fa", "ey", "hrb", "hr", "he", "ha"]
+Z_ORDER = ["hrb", "bd", "lh", "rh", "lg", "sh", "ch", "cc", "ca", "ls", "rs", "lc", "rc", "wa", "cp",
+           "hd", "fc", "ey", "ea", "fa", "hr", "he", "ha"]
 BG = (200, 202, 208, 255)
 
 
@@ -325,7 +331,7 @@ def garment_preview(decoders: dict, offsets: dict):
             for img, x, y in placed:
                 tile.alpha_composite(img, (x - x0, y - y0))
             box = tile.getbbox()
-            if box:
+            if box and (box[2] - box[0]) * (box[3] - box[1]) > 1:  # ignora marcadores de 1 píxel
                 tiles.append((label, tile.crop(box)))
         if tiles:
             tile_rows.append(tiles)
@@ -333,7 +339,8 @@ def garment_preview(decoders: dict, offsets: dict):
         return None
 
     pad, label_h, min_cell = 8, 22, 64
-    scale = 3
+    biggest = max(max(t.width, t.height) for r in tile_rows for _l, t in r)
+    scale = 6 if biggest <= 24 else 5 if biggest <= 40 else 4 if biggest <= 70 else 3
 
     def row_width(tiles, sc):
         return sum(max(t.width * sc, min_cell) + pad for _l, t in tiles) + pad
@@ -438,6 +445,8 @@ def lib_preview_png(swf_url: str):
 
 # ----------------------------------------------------------------- Discord
 def send_discord(text: str, png: bytes = None, filename: str = "ropa.png") -> None:
+    if png and len(png) > MAX_PNG_BYTES:
+        png = None  # demasiado pesada para Discord: se avisa solo con texto
     if not WEBHOOK:
         print("Falta DISCORD_WEBHOOK_URL; mensaje no enviado:", text, "(con imagen)" if png else "")
         return
@@ -504,11 +513,12 @@ def main() -> int:
         save_snapshot(hotel, new_ids)
         state["urls"][hotel] = new_url
 
-    for lib_id, info in sorted(found.items()):
+    for n, (lib_id, info) in enumerate(sorted(found.items())):
         text = f"👕 Se ha encontrado la siguiente ropa **{lib_id}** — {', '.join(info['hotels'])}"
         png = None
         try:
-            png = lib_preview_png(f"{info['url']}{lib_id}.swf")
+            if n < MAX_PREVIEWS:
+                png = lib_preview_png(f"{info['url']}{lib_id}.swf")
         except Exception as exc:  # si falla la imagen, igual se avisa con texto
             print(f"[{lib_id}] error obteniendo imágenes: {exc}", file=sys.stderr)
         send_discord(text, png, f"{lib_id}.png")
