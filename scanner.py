@@ -303,6 +303,25 @@ SHEET_MAX_H = 1500      # alto aproximado máx. (px) de cada hoja de "otros esta
 MAX_EXTRA_SHEETS = 6    # máx. hojas extra (Discord admite 10 adjuntos por mensaje)
 
 
+ANOMALY_RATIO = 5   # una vista más de 5 veces mayor que la de pie se considera defectuosa
+ALPHA_MIN = 24   # píxeles con menos opacidad se consideran invisibles (ruido que agranda los recuadros)
+
+
+def _visible_bbox(img):
+    """Recuadro del contenido realmente visible (ignora píxeles casi transparentes)."""
+    return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0).getbbox()
+
+
+def _visible_pixels(img) -> int:
+    """Cantidad de píxeles visibles (opacidad mayor que ALPHA_MIN)."""
+    return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0).histogram()[255]
+
+
+def _family(ptype: str) -> str:
+    """Familia de la pieza: en las mascotas pt, ptl y ptr son la misma mascota (izquierda/derecha)."""
+    return "pt" if ptype.startswith("pt") else ptype
+
+
 def _collect_views(decoders: dict, offsets: dict) -> dict:
     """acción -> dirección -> (tipo, id) -> {frame: (nombre_corto, nombre)}"""
     views = {}
@@ -317,12 +336,14 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
 
 
 def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
-               fill_types=None):
+               fill_types=None, ref_area: dict = None):
     """
     Fila de un estado: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...] (una por dirección).
     Los gestos (saludar, beber, hablar...) solo traen las piezas que cambian (p. ej. una manga);
     `base` son las piezas de "de pie" (std): las que el gesto no trae se completan desde ahí,
     para ver la prenda entera y no solo la pieza suelta.
+    `ref_area`: área de cada dirección en la pose de pie. Si una vista ocupa más de ANOMALY_RATIO veces
+    ese área, el .swf trae piezas fuera de lugar (p. ej. una imagen-atlas con varios sprites sueltos) y se omite.
     `fill_types`: si se indica, solo esos tipos de pieza se completan desde la base.
     `shift` corrige el origen de las piezas propias del estado (las expresiones tumbado vienen
     desplazadas respecto a la pose "lay").
@@ -333,12 +354,12 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
         flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
         if base:
-            have = {t for t, _pid in parts}
+            have = {_family(t) for t, _pid in parts}
             src_dir, mirror = direction, False
             if direction not in base and MIRROR_OF.get(direction) in base:
                 src_dir, mirror = MIRROR_OF[direction], True  # Habbo: 4, 5, 6 = espejo de 2, 1, 0
             for key, fr in base.get(src_dir, {}).items():
-                if key[0] not in have and (fill_types is None or key[0] in fill_types):
+                if _family(key[0]) not in have and (fill_types is None or key[0] in fill_types):
                     parts[key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
                     if mirror:
                         flipped.add(key)
@@ -377,13 +398,20 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             for img, x, y in pl:
                 tile.alpha_composite(img, (x - x0, y - y0))
             canvases.append(tile)
-            if tile.getbbox():
-                boxes.append(tile.getbbox())
+            box = _visible_bbox(tile)
+            if box:
+                boxes.append(box)
         if not boxes:
             continue
         crop = (min(b[0] for b in boxes), min(b[1] for b in boxes),
                 max(b[2] for b in boxes), max(b[3] for b in boxes))
-        if (crop[2] - crop[0]) * (crop[3] - crop[1]) <= 1:  # marcador de 1 píxel
+        area = (crop[2] - crop[0]) * (crop[3] - crop[1])
+        if area <= 1 or max(_visible_pixels(c) for c in canvases) < 4:  # marcador o ruido casi invisible
+            continue
+        ref = (ref_area or {}).get(direction) or (ref_area or {}).get(MIRROR_OF.get(direction))
+        if ref and area > ANOMALY_RATIO * ref:
+            print(f"  aviso: '{action} {direction}' omitido: imágenes fuera de lugar en el .swf "
+                  f"({area} px² frente a {ref} px² de pie)", file=sys.stderr)
             continue
         row.append((f"{action} {direction}", [c.crop(crop) for c in canvases]))
     return row
@@ -462,15 +490,17 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
     seen = set()
 
     def unique(row):
-        """Descarta estados idénticos a otro ya incluido (p. ej. 'hablar' igual que 'de pie')."""
-        sig = tuple((label.split()[-1], tuple(hashlib.md5(f.tobytes()).hexdigest() for f in frames))
-                    for label, frames in row)
-        if not row or sig in seen:
+        """Descarta estados cuyas vistas son idénticas a otras ya incluidas (p. ej. 'cargar' igual que 'de pie')."""
+        sigs = [(label.split()[-1], tuple(hashlib.md5(f.tobytes()).hexdigest() for f in frames))
+                for label, frames in row]
+        if not row or all(x in seen for x in sigs):
             return False
-        seen.add(sig)
+        seen.update(sigs)
         return True
 
     std, lay = views.get("std"), views.get("lay")
+    std_row = _build_row("std", std, decoders, offsets) if std else []
+    std_area = {int(label.split()[-1]): t[0].width * t[0].height for label, t in std_row}
 
     def row_of(a):
         # std y lay son poses completas. Las expresiones tumbado (lag, lsp...) se completan con "lay";
@@ -484,7 +514,7 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
             base = std
             if a == "sit":  # sentado cambia el cuerpo: solo la cabeza se completa desde "de pie"
                 fill = HEAD_TYPES
-        return _build_row(a, views[a], decoders, offsets, base, shift, fill)
+        return _build_row(a, views[a], decoders, offsets, base, shift, fill, None if a == "std" else std_area)
 
     main_rows = [r for r in (row_of(a) for a in main) if unique(r)]
     other_rows = [r for r in (row_of(a) for a in others) if unique(r)]
