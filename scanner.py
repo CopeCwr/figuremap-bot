@@ -295,9 +295,8 @@ MAIN_ACTIONS = ("std", "sit", "lay", "wlk")   # de pie, sentado, tumbado, camina
 OTHER_ORDER = ["wav", "drk", "crr", "spk", "respect", "sig", "blw", "sml", "sad", "agr", "srp",
                "lag", "lsa", "lsm", "lsp", "lsr", "ley", "eyb"]
 LAY_ACTIONS = {"lag", "ley", "lsa", "lsm", "lsp", "lsr"}   # expresiones en pose tumbado
-HEAD_TYPES = {"hd", "fc", "ey", "hr", "hrb", "ha", "he", "ea", "fa"}   # no cambian al sentarse
 # Al espejar una dirección, lo que era el lado izquierdo pasa a ser el derecho
-SWAP_LR = {"ls": "rs", "rs": "ls", "lh": "rh", "rh": "lh", "lc": "rc", "rc": "lc"}
+SWAP_LR = {"ls": "rs", "rs": "ls", "lh": "rh", "rh": "lh", "lc": "rc", "rc": "lc", "ptl": "ptr", "ptr": "ptl"}
 # Brazo "lejano" de cada dirección: se dibuja detrás del torso (mirando a la derecha: el izquierdo)
 FAR_TYPES = {0: {"ls", "lc", "lh"}, 1: {"ls", "lc", "lh"}, 2: {"ls", "lc", "lh"},
              4: {"rs", "rc", "rh"}, 5: {"rs", "rc", "rh"}, 6: {"rs", "rc", "rh"}}
@@ -320,11 +319,6 @@ def _visible_bbox(img):
 def _visible_pixels(img) -> int:
     """Cantidad de píxeles visibles (opacidad mayor que ALPHA_MIN)."""
     return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0).histogram()[255]
-
-
-def _family(ptype: str) -> str:
-    """Familia de la pieza: en las mascotas pt, ptl y ptr son la misma mascota (izquierda/derecha)."""
-    return "pt" if ptype.startswith("pt") else ptype
 
 
 def _collect_views(decoders: dict, offsets: dict) -> dict:
@@ -359,17 +353,29 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
         flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
         if base:
-            have = {_family(t) for t, _pid in parts}
             src_dir, mirror = direction, False
             if direction not in base and MIRROR_OF.get(direction) in base:
                 src_dir, mirror = MIRROR_OF[direction], True  # Habbo: 4, 5, 6 = espejo de 2, 1, 0
+            base_types = {SWAP_LR.get(k[0], k[0]) if mirror else k[0] for k in base.get(src_dir, {})}
+            own_types = {t for t, _pid in own}
             for key, fr in base.get(src_dir, {}).items():
                 ptype = SWAP_LR.get(key[0], key[0]) if mirror else key[0]   # espejo: izquierda <-> derecha
-                if _family(ptype) not in have and (fill_types is None or ptype in fill_types):
-                    new_key = (ptype, key[1])
-                    parts[new_key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
-                    if mirror:
-                        flipped.add(new_key)
+                new_key = (ptype, key[1])
+                if new_key in parts:                       # el estado ya trae esta pieza exacta (tipo + id)
+                    continue
+                if ptype in ("ptl", "ptr"):
+                    # Mascota que alterna de lado (ptl <-> ptr): si el estado trae el lado contrario y la base
+                    # no lo tiene, son la misma mascota y no se duplica (el fantasma tiene ambos lados: no aplica).
+                    opp_type = "ptr" if ptype == "ptl" else "ptl"
+                    if opp_type in own_types and opp_type not in base_types:
+                        continue
+                if fill_types is not None and ptype not in fill_types:
+                    continue
+                if action == "sit" and ptype in ("lc", "rc", "ca") and any(t == "cc" for t, _ in own):
+                    continue                               # abrigo sentado: el cc ya trae su propia forma
+                parts[new_key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
+                if mirror:
+                    flipped.add(new_key)
         frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
         far = FAR_TYPES.get(direction, ())
 
@@ -526,8 +532,6 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
             base, shift = lay, LAY_SHIFT
         else:
             base = std
-            if a == "sit":  # sentado cambia el cuerpo: solo la cabeza se completa desde "de pie"
-                fill = HEAD_TYPES
         return _build_row(a, views[a], decoders, offsets, base, shift, fill, None if a == "std" else std_area)
 
     main_rows = [r for r in (row_of(a) for a in main) if unique(r)]
