@@ -296,6 +296,11 @@ OTHER_ORDER = ["wav", "drk", "crr", "spk", "respect", "sig", "blw", "sml", "sad"
                "lag", "lsa", "lsm", "lsp", "lsr", "ley", "eyb"]
 LAY_ACTIONS = {"lag", "ley", "lsa", "lsm", "lsp", "lsr"}   # expresiones en pose tumbado
 HEAD_TYPES = {"hd", "fc", "ey", "hr", "hrb", "ha", "he", "ea", "fa"}   # no cambian al sentarse
+# Al espejar una dirección, lo que era el lado izquierdo pasa a ser el derecho
+SWAP_LR = {"ls": "rs", "rs": "ls", "lh": "rh", "rh": "lh", "lc": "rc", "rc": "lc"}
+# Brazo "lejano" de cada dirección: se dibuja detrás del torso (mirando a la derecha: el izquierdo)
+FAR_TYPES = {0: {"ls", "lc", "lh"}, 1: {"ls", "lc", "lh"}, 2: {"ls", "lc", "lh"},
+             4: {"rs", "rc", "rh"}, 5: {"rs", "rc", "rh"}, 6: {"rs", "rc", "rh"}}
 MIRROR_OF = {4: 2, 5: 1, 6: 0}   # direcciones que Habbo dibuja como espejo de otra
 MIRROR_AXIS2 = 67                # 2 x el eje central del avatar (x ≈ 33,5)
 LAY_SHIFT = (-64, -160)   # esas piezas usan otro origen: con este ajuste coinciden con la pose "lay"
@@ -359,12 +364,21 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             if direction not in base and MIRROR_OF.get(direction) in base:
                 src_dir, mirror = MIRROR_OF[direction], True  # Habbo: 4, 5, 6 = espejo de 2, 1, 0
             for key, fr in base.get(src_dir, {}).items():
-                if _family(key[0]) not in have and (fill_types is None or key[0] in fill_types):
-                    parts[key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
+                ptype = SWAP_LR.get(key[0], key[0]) if mirror else key[0]   # espejo: izquierda <-> derecha
+                if _family(ptype) not in have and (fill_types is None or ptype in fill_types):
+                    new_key = (ptype, key[1])
+                    parts[new_key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
                     if mirror:
-                        flipped.add(key)
+                        flipped.add(new_key)
         frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
-        order = sorted(parts, key=lambda k: (Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER), k[1], k[0]))
+        far = FAR_TYPES.get(direction, ())
+
+        def z(k, far=far):
+            if k[0] in far:
+                return -1   # brazo lejano: detrás del torso
+            return Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER)
+
+        order = sorted(parts, key=lambda k: (z(k), k[1], k[0]))
         composed = []  # un lienzo (con su posición) por frame
         for f in frames:
             placed = []
