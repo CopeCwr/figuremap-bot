@@ -5,6 +5,11 @@ Comando por escrito para Discord (sin hosting, con GitHub Actions).
 Escribes en el canal el nombre de una ropa, por ejemplo:   shirt_U_batonesie
 y el bot responde a ese mensaje con la imagen (todos sus estados).
 
+También puede vestir al personaje (hh_human_body) con varias prendas a la vez:
+    vestir shirt_U_batonesie hair_U_longelvenhair acc_head_U_summerbraid
+Las prendas se apilan en el orden en que las escribes. Añade la palabra "todo" para ver también los
+estados extra (saludar, beber, cargar...):   vestir shirt_U_batonesie todo
+
 Flujo (cada ~5 minutos, desde el workflow comando.yml):
  1. Lee los mensajes nuevos del canal (API de Discord, con el token del bot).
  2. Busca nombres de ropa en cada mensaje y comprueba que existan en el figuremap de Habbo.
@@ -33,6 +38,9 @@ CHANNEL = os.environ.get("DISCORD_COMMAND_CHANNEL_ID", "")
 FIRST_HOTEL = os.environ.get("COMMAND_HOTEL", "habbo.es")
 STATE_FILE = Path("state") / "comando.json"
 
+DRESS_WORDS = {"vestir", "personaje", "outfit"}
+MAX_DRESS_LIBS = 8
+LOCAL_CHARACTER = Path("hh_human_body.swf")   # copia local opcional del personaje base
 LIB_RE = re.compile(r"[A-Za-z0-9]+(?:_[A-Za-z0-9]+)+")   # p. ej. shirt_U_batonesie
 MAX_LIBS_PER_MESSAGE = 5
 MAX_MESSAGES_PER_RUN = 20
@@ -142,6 +150,84 @@ def extract_libs(content: str):
     return libs[:MAX_LIBS_PER_MESSAGE], only
 
 
+# ----------------------------------------------------------------- personaje vestido
+def is_dress_command(content: str) -> bool:
+    words = content.split()
+    return bool(words) and words[0].lower().lstrip("!/") in DRESS_WORDS
+
+
+def download_parts(base_url: str, lib_id: str):
+    """Descarga el .swf de una lib y devuelve (decoders, offsets), o None si no existe."""
+    r = requests.get(f"{base_url}{lib_id}.swf", headers=scanner.HEADERS, timeout=60)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    if len(r.content) > scanner.MAX_SWF_BYTES:
+        return None
+    return scanner.read_swf(r.content)
+
+
+def handle_dress(message_id: str, content: str, finder: "Finder") -> None:
+    """Comando 'vestir': personaje base + las prendas indicadas, apiladas en orden."""
+    rest = content.split(None, 1)[1] if len(content.split(None, 1)) > 1 else ""
+    all_states = bool(re.search(r"\b(todo|todos|todas|estados)\b", rest.lower()))
+    names = []
+    for x in LIB_RE.findall(rest):
+        if x.lower() not in [n.lower() for n in names]:
+            names.append(x)
+    names = names[:MAX_DRESS_LIBS]
+    if not names:
+        reply(message_id, "👕 Escribe el nombre de las prendas, por ejemplo:\n"
+                          "`vestir shirt_U_batonesie hair_U_longelvenhair`\n"
+                          "Añade `todo` para ver también saludar, beber, cargar...")
+        return
+
+    # personaje base: primero del figuremap de Habbo; si no está, la copia local del repo
+    base_parts = None
+    hit = finder.find(scanner.CHARACTER_LIB)
+    if hit:
+        try:
+            base_parts = download_parts(hit[1], hit[0])
+        except Exception as exc:
+            print(f"[personaje] error descargando {scanner.CHARACTER_LIB}: {exc}", file=sys.stderr)
+    if base_parts is None and LOCAL_CHARACTER.exists():
+        base_parts = scanner.read_swf(LOCAL_CHARACTER.read_bytes())
+    if base_parts is None:
+        reply(message_id, f"⚠️ No pude obtener el personaje base ({scanner.CHARACTER_LIB}).")
+        return
+    libs, used, missing, hotel = [scanner.character_parts(*base_parts)], [], [], None
+    for name in names:
+        found = finder.find(name)
+        parts = None
+        if found:
+            try:
+                parts = download_parts(found[1], found[0])
+            except Exception as exc:
+                print(f"[{name}] error descargando: {exc}", file=sys.stderr)
+        if not parts:
+            missing.append(name)
+            continue
+        libs.append(parts)
+        used.append(found[0])
+        hotel = hotel or found[2]
+
+    if not used:
+        reply(message_id, "❓ No encontré ninguna de esas prendas: " + ", ".join(f"**{n}**" for n in missing))
+        return
+    try:
+        sheets = scanner.dressed_previews(libs, all_states)
+    except Exception as exc:
+        print(f"[personaje] error armando el personaje: {exc}", file=sys.stderr)
+        reply(message_id, "⚠️ No pude armar el personaje con esas prendas.")
+        return
+    attachments = [(data, f"personaje{suffix}.{ext}", scanner.MIME.get(ext, "application/octet-stream"))
+                   for data, ext, suffix in sheets]
+    text = "🧍 **Personaje vestido** con: " + ", ".join(f"**{u}**" for u in used) + f" — {hotel}"
+    if missing:
+        text += "\n❓ No encontré: " + ", ".join(f"**{n}**" for n in missing)
+    reply(message_id, text, attachments)
+
+
 # ----------------------------------------------------------------- principal
 def main() -> int:
     if not TOKEN or not CHANNEL:
@@ -175,6 +261,12 @@ def main() -> int:
             if not warned_empty and not m.get("attachments"):
                 print("Aviso: mensaje sin texto. Activa 'Message Content Intent' en el portal de Discord.")
                 warned_empty = True
+            continue
+        if is_dress_command(content):
+            try:
+                handle_dress(m["id"], content, finder)
+            except Exception as exc:
+                print(f"[vestir] error: {exc}", file=sys.stderr)
             continue
         libs, only_libs = extract_libs(content)
         for name in libs:
