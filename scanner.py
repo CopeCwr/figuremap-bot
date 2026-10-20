@@ -334,8 +334,11 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
     return views
 
 
+_OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
+
+
 def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
-               fill_types=None, ref_area: dict = None):
+               fill_types=None, ref_area: dict = None, skip_dirs=None):
     """
     Fila de un estado: [(etiqueta, [imagen_frame0, imagen_frame1, ...]), ...] (una por dirección).
     Los gestos (saludar, beber, hablar...) solo traen las piezas que cambian (p. ej. una manga);
@@ -349,6 +352,8 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
     """
     row = []
     for direction in sorted(dirs):
+        if skip_dirs and (action, direction) in skip_dirs:
+            continue
         parts = dict(dirs[direction])
         own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
         flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
@@ -432,6 +437,7 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         if ref and area > ANOMALY_RATIO * ref:
             print(f"  aviso: '{action} {direction}' omitido: imágenes fuera de lugar en el .swf "
                   f"({area} px² frente a {ref} px² de pie)", file=sys.stderr)
+            _OMITTED.append((action, direction))
             continue
         row.append((f"{action} {direction}", [c.crop(crop) for c in canvases]))
     return row
@@ -494,7 +500,8 @@ def _render_sheet(rows: list):
     return buf.getvalue(), "gif"
 
 
-def garment_previews(decoders: dict, offsets: dict) -> list:
+def garment_previews(decoders: dict, offsets: dict, only_actions=None, skip_views=None,
+                     check_anomaly: bool = True) -> list:
     """
     Arma la prenda COMPLETA (todas las piezas unidas con los offsets del manifest) en TODOS sus estados,
     se muevan o no. Devuelve una lista de (bytes, extensión, sufijo_del_archivo):
@@ -504,6 +511,8 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
     Los estados con imágenes idénticas a otro ya incluido se omiten.
     """
     views = _collect_views(decoders, offsets)
+    if only_actions is not None:   # solo esos estados (el resto se descarta)
+        views = {a: v for a, v in views.items() if a in only_actions}
     main = [a for a in MAIN_ACTIONS if a in views]
     others = sorted((a for a in views if a not in MAIN_ACTIONS),
                     key=lambda a: (OTHER_ORDER.index(a) if a in OTHER_ORDER else len(OTHER_ORDER), a))
@@ -532,7 +541,8 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
             base, shift = lay, LAY_SHIFT
         else:
             base = std
-        return _build_row(a, views[a], decoders, offsets, base, shift, fill, None if a == "std" else std_area)
+        ref = None if (a == "std" or not check_anomaly) else std_area
+        return _build_row(a, views[a], decoders, offsets, base, shift, fill, ref, skip_views)
 
     main_rows = [r for r in (row_of(a) for a in main) if unique(r)]
     other_rows = [r for r in (row_of(a) for a in others) if unique(r)]
@@ -560,6 +570,116 @@ def garment_previews(decoders: dict, offsets: dict) -> list:
         data, ext = _render_sheet(rows)
         out.append((data, ext, suffix))
     return out
+
+
+# ----------------------------------------------------------------- personaje vestido
+CHARACTER_LIB = "hh_human_body"   # lib del personaje base (cuerpo, cabeza y manos)
+CHARACTER_HEAD_ID = 1             # el .swf trae 4 cabezas (ids 1-4): se usa solo una
+CHARACTER_SKIP_TYPES = {"sd"}     # sd = sombra del suelo
+
+
+def character_parts(decoders: dict, offsets: dict):
+    """Deja solo las piezas del personaje base que se dibujan (una cabeza, sin sombra)."""
+    keep = {}
+    for name, fn in decoders.items():
+        m = ASSET_RE.search(name)
+        if m:
+            ptype, pid = m.group(2), int(m.group(3))
+            if ptype in CHARACTER_SKIP_TYPES or (ptype == "hd" and pid != CHARACTER_HEAD_ID):
+                continue
+        keep[name] = fn
+    return keep, offsets
+
+
+def merge_libs(libs: list):
+    """
+    Junta varias libs (personaje + prendas) en un solo conjunto de piezas.
+    libs = [(decoders, offsets), ...] en orden de apilado: la primera es el personaje y las siguientes
+    se dibujan encima. Cada lib recibe ids propios para que nunca se mezclen piezas de libs distintas.
+    """
+    merged_dec, merged_off = {}, {}
+    for idx, (dec, off) in enumerate(libs):
+        for name, fn in dec.items():
+            m = ASSET_RE.search(name)
+            if not m or m.group(0) not in off:
+                continue
+            new_short = f"h_{m.group(1)}_{m.group(2)}_{int(m.group(3)) + idx * 100000}_{m.group(4)}_{m.group(5)}"
+            merged_dec[f"{idx}:{name[:m.start()]}{new_short}"] = fn
+            merged_off[new_short] = off[m.group(0)]
+    return merged_dec, merged_off
+
+
+def dressed_previews(libs: list, all_states: bool = False) -> list:
+    """
+    Personaje vestido. libs = [(decoders, offsets), ...] con el personaje base primero.
+    Devuelve [(bytes, extensión, sufijo)]: la hoja principal (de pie, sentado, acostado y caminando) y,
+    si all_states=True, también las hojas de otros estados (saludar, beber, cargar...).
+    Solo se muestran los estados que traen las prendas (no los gestos sueltos del personaje) y se omiten
+    las vistas defectuosas de la prenda, detectadas comparándola sola.
+    """
+    garments = libs[1:]
+    garment_actions, skip = set(), set()
+    if garments:
+        g_dec, g_off = merge_libs(garments)
+        del _OMITTED[:]
+        try:
+            garment_previews(g_dec, g_off)   # solo para detectar vistas defectuosas de la prenda
+        except Exception as exc:
+            print(f"  aviso: no se pudo revisar la prenda sola: {exc}", file=sys.stderr)
+        skip = set(_OMITTED)
+        for name in g_dec:
+            m = ASSET_RE.search(name)
+            if m:
+                garment_actions.add(m.group(1))
+    only = (set(MAIN_ACTIONS) | garment_actions) - LAY_ACTIONS
+    decoders, offsets = merge_libs(libs)
+    sheets = garment_previews(decoders, offsets, only_actions=only, skip_views=skip, check_anomaly=False)
+    return sheets if all_states else sheets[:1]
+
+
+CHARACTER_LOCAL = Path("hh_human_body.swf")   # copia local opcional (respaldo si no se puede descargar)
+_CHARACTER_CACHE = {}
+
+
+def get_character(base_url: str):
+    """Personaje base (hh_human_body) de la misma versión del juego; None si no está disponible."""
+    if base_url in _CHARACTER_CACHE:
+        return _CHARACTER_CACHE[base_url]
+    parts = None
+    try:
+        r = requests.get(f"{base_url}{CHARACTER_LIB}.swf", headers=HEADERS, timeout=60)
+        if r.status_code == 200 and len(r.content) <= MAX_SWF_BYTES:
+            parts = read_swf(r.content)
+    except Exception as exc:
+        print(f"  no se pudo descargar {CHARACTER_LIB}: {exc}", file=sys.stderr)
+    if parts is None and CHARACTER_LOCAL.exists():
+        parts = read_swf(CHARACTER_LOCAL.read_bytes())
+    _CHARACTER_CACHE[base_url] = character_parts(*parts) if parts else None
+    return _CHARACTER_CACHE[base_url]
+
+
+def is_full_character(decoders: dict) -> bool:
+    """Las pieles traen su propio cuerpo y cabeza: no se visten sobre el personaje base."""
+    for name in decoders:
+        m = ASSET_RE.search(name)
+        if m and m.group(2) in ("bd", "hd"):
+            return True
+    return False
+
+
+def build_lib_previews(decoders: dict, offsets: dict, base_url: str) -> list:
+    """Vista por defecto de una prenda: puesta sobre el personaje (o sola si es una piel o no hay personaje)."""
+    if not offsets:
+        return []
+    character = None if is_full_character(decoders) else get_character(base_url)
+    if character:
+        try:
+            result = dressed_previews([character, (decoders, offsets)], all_states=True)
+            if result:
+                return result
+        except Exception as exc:
+            print(f"  error vistiendo al personaje: {exc}", file=sys.stderr)
+    return garment_previews(decoders, offsets)
 
 
 def pick_preview_names(names: list) -> list:
@@ -617,8 +737,7 @@ def lib_previews(swf_url: str) -> list:
         return []
     result = []
     try:
-        if offsets:
-            result = garment_previews(decoders, offsets)
+        result = build_lib_previews(decoders, offsets, swf_url.rsplit("/", 1)[0] + "/")
     except Exception as exc:
         print(f"  error armando la prenda: {exc}", file=sys.stderr)
     if result:
