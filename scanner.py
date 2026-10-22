@@ -31,7 +31,7 @@ import zlib
 from pathlib import Path
 
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageChops, ImageOps
 
 HOTELS = {
     "sandbox.habbo.com": "https://sandbox.habbo.com/gamedata/external_variables/1",
@@ -300,6 +300,12 @@ SWAP_LR = {"ls": "rs", "rs": "ls", "lh": "rh", "rh": "lh", "lc": "rc", "rc": "lc
 # Brazo "lejano" de cada dirección: se dibuja detrás del torso (mirando a la derecha: el izquierdo)
 FAR_TYPES = {0: {"ls", "lc", "lh"}, 1: {"ls", "lc", "lh"}, 2: {"ls", "lc", "lh"},
              4: {"rs", "rc", "rh"}, 5: {"rs", "rc", "rh"}, 6: {"rs", "rc", "rh"}}
+# Brazo "cercano" a la cámara de cada dirección (el lejano está en FAR_TYPES)
+NEAR_TYPES = {0: {"rs", "rc", "rh"}, 1: {"rs", "rc", "rh"}, 2: {"rs", "rc", "rh"},
+              4: {"ls", "lc", "lh"}, 5: {"ls", "lc", "lh"}, 6: {"ls", "lc", "lh"}}
+ARM_TYPES = {"ls", "rs", "lc", "rc", "lh", "rh"}
+RAISED_Y = -52      # un brazo cuya parte superior queda por encima de esta altura está levantado (junto a la cabeza)
+HIDDEN_RATIO = 0.85  # un brazo lejano levantado que queda tapado casi del todo se dibuja delante
 MIRROR_OF = {4: 2, 5: 1, 6: 0}   # direcciones que Habbo dibuja como espejo de otra
 MIRROR_AXIS2 = 67                # 2 x el eje central del avatar (x ≈ 33,5)
 LAY_SHIFT = (-64, -160)   # esas piezas usan otro origen: con este ajuste coinciden con la pose "lay"
@@ -335,6 +341,44 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
 
 
 _OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
+
+
+def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list:
+    """
+    Un brazo lejano levantado (p. ej. la mano que bebe) que queda tapado casi del todo por lo que se dibuja
+    después no se vería nunca: se dibuja delante. Los brazos lejanos que cuelgan se dejan detrás.
+    """
+    if not far or len(placed) < 2:
+        return placed
+    x0 = min(x for _i, x, _y in placed)
+    y0 = min(y for _i, _x, y in placed)
+    size = (max(x + i.width for i, x, _y in placed) - x0, max(y + i.height for i, _x, y in placed) - y0)
+
+    def mask_of(img):
+        return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0)
+
+    front = []
+    for idx, key in enumerate(keys):
+        if key[0] not in far or not raised(key):
+            continue
+        img, x, y = placed[idx]
+        own = Image.new("L", size, 0)
+        own.paste(mask_of(img), (x - x0, y - y0))
+        visible = own.histogram()[255]
+        if visible < 6:
+            continue
+        later = Image.new("L", size, 0)
+        for j in range(idx + 1, len(placed)):
+            if j in front:
+                continue
+            im2, x2, y2 = placed[j]
+            later.paste(255, (x2 - x0, y2 - y0), mask_of(im2))
+        covered = ImageChops.multiply(own, later).histogram()[255]
+        if covered / visible >= HIDDEN_RATIO:
+            front.append(idx)
+    if not front:
+        return placed
+    return [p for i, p in enumerate(placed) if i not in front] + [placed[i] for i in front]
 
 
 def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
@@ -383,8 +427,18 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                     flipped.add(new_key)
         frames = sorted({f for p in parts.values() for f in p})[:MAX_FRAMES]
         far = FAR_TYPES.get(direction, ())
+        near = NEAR_TYPES.get(direction, ())
+        front_all = direction in (3, 7)   # de frente y de espaldas no hay lado cercano: todo brazo levantado va delante
 
-        def z(k, far=far):
+        def raised(k):
+            if k[0] not in ARM_TYPES:
+                return False
+            entry = parts[k].get(0) or parts[k][min(parts[k])]
+            return -offsets[entry[0]][1] < RAISED_Y
+
+        def z(k, far=far, near=near):
+            if raised(k) and (k[0] in near or front_all):
+                return len(Z_ORDER) - 0.5   # brazo levantado cercano: delante de la cabeza
             if k[0] in far:
                 return -1   # brazo lejano: detrás del torso
             return Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER)
@@ -392,7 +446,7 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         order = sorted(parts, key=lambda k: (z(k), k[1], k[0]))
         composed = []  # un lienzo (con su posición) por frame
         for f in frames:
-            placed = []
+            placed, placed_keys = [], []
             for key in order:
                 pframes = parts[key]
                 short, name = pframes.get(f) or pframes.get(0) or pframes[min(pframes)]
@@ -405,10 +459,13 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                 if key in flipped:  # espejo respecto al eje central del avatar
                     img = ImageOps.mirror(img)
                     placed.append((img, MIRROR_AXIS2 - (-ox) - img.width, -oy))
+                    placed_keys.append(key)
                     continue
                 dx, dy = shift if key in own else (0, 0)
                 placed.append((img, -ox + dx, -oy + dy))  # esquina superior izquierda = (-offset)
+                placed_keys.append(key)
             if placed:
+                placed = _bring_hidden_arms_front(placed, placed_keys, far, raised)
                 composed.append(placed)
         if not composed:
             continue
