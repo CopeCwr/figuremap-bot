@@ -272,7 +272,7 @@ def read_swf(data: bytes):
 # Nombre de cada imagen de ropa: h_<acción>_<tipo>_<id>_<dirección>_<frame>
 ASSET_RE = re.compile(r"h_([a-z]+)_([a-z]+)_(\d+)_(\d)_(\d+)$")
 # Orden de dibujo aproximado por tipo de pieza (de atrás hacia delante)
-Z_ORDER = ["hrb", "bd", "lh", "rh", "lg", "sh", "ch", "cc", "ca", "ls", "rs", "lc", "rc", "wa", "cp",
+Z_ORDER = ["hrb", "bd", "lg", "sh", "ch", "cc", "ca", "lh", "rh", "ls", "rs", "lc", "rc", "wa", "cp",
            "hd", "fc", "ey", "ea", "fa", "hr", "he", "ha"]
 BG = (200, 202, 208, 255)
 
@@ -303,7 +303,9 @@ FAR_TYPES = {0: {"ls", "lc", "lh"}, 1: {"ls", "lc", "lh"}, 2: {"ls", "lc", "lh"}
 # Brazo "cercano" a la cámara de cada dirección (el lejano está en FAR_TYPES)
 NEAR_TYPES = {0: {"rs", "rc", "rh"}, 1: {"rs", "rc", "rh"}, 2: {"rs", "rc", "rh"},
               4: {"ls", "lc", "lh"}, 5: {"ls", "lc", "lh"}, 6: {"ls", "lc", "lh"}}
-ARM_TYPES = {"ls", "rs", "lc", "rc", "lh", "rh"}
+LEFT_ARM = {"ls", "lc", "lh"}
+RIGHT_ARM = {"rs", "rc", "rh"}
+ARM_TYPES = LEFT_ARM | RIGHT_ARM
 RAISED_Y = -52      # un brazo cuya parte superior queda por encima de esta altura está levantado (junto a la cabeza)
 HIDDEN_RATIO = 0.85  # un brazo lejano levantado que queda tapado casi del todo se dibuja delante
 MIRROR_OF = {4: 2, 5: 1, 6: 0}   # direcciones que Habbo dibuja como espejo de otra
@@ -338,6 +340,48 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
         direction, frame = int(m.group(4)), int(m.group(5))
         views.setdefault(action, {}).setdefault(direction, {}).setdefault((ptype, pid), {})[frame] = (m.group(0), name)
     return views
+
+
+_OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
+
+
+def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list:
+    """
+    Un brazo lejano levantado (p. ej. la mano que bebe) que queda tapado casi del todo por lo que se dibuja
+    después no se vería nunca: se dibuja delante, entero (mano y manga juntas). Los brazos que cuelgan se dejan.
+    """
+    if not far or len(placed) < 2:
+        return placed
+    x0 = min(x for _i, x, _y in placed)
+    y0 = min(y for _i, _x, y in placed)
+    size = (max(x + i.width for i, x, _y in placed) - x0, max(y + i.height for i, _x, y in placed) - y0)
+
+    def mask_of(img):
+        return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0)
+
+    front = []
+    for side in (LEFT_ARM, RIGHT_ARM):
+        idxs = [i for i, k in enumerate(keys) if k[0] in side and k[0] in far]
+        if not idxs or not any(raised(keys[i]) for i in idxs):
+            continue
+        own = Image.new("L", size, 0)
+        for i in idxs:
+            im, x, y = placed[i]
+            own.paste(255, (x - x0, y - y0), mask_of(im))
+        visible = own.histogram()[255]
+        if visible < 6:
+            continue
+        later = Image.new("L", size, 0)
+        for j, (im2, x2, y2) in enumerate(placed):
+            if j in idxs or j in front:
+                continue
+            later.paste(255, (x2 - x0, y2 - y0), mask_of(im2))
+        covered = ImageChops.multiply(own, later).histogram()[255]
+        if covered / visible >= HIDDEN_RATIO:
+            front.extend(idxs)
+    if not front:
+        return placed
+    return [p for i, p in enumerate(placed) if i not in front] + [placed[i] for i in sorted(front)]
 
 
 _OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
@@ -401,6 +445,19 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         parts = dict(dirs[direction])
         own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
         flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
+        src_same = MIRROR_OF.get(direction)
+        if src_same in dirs:
+            # Habbo dibuja 4, 5 y 6 como espejo de 2, 1 y 0 del MISMO estado (izquierda <-> derecha).
+            # Solo para las libs (personaje o prenda) que no traen NINGUNA pieza propia en esta dirección;
+            # si traen alguna, el resto de sus piezas se completa desde "de pie".
+            libs_here = {k[1] // 100000 for k in own}
+            for key, fr in dirs[src_same].items():
+                ptype = SWAP_LR.get(key[0], key[0])
+                new_key = (ptype, key[1])
+                if new_key in parts or ptype.startswith("pt") or key[1] // 100000 in libs_here:
+                    continue
+                parts[new_key] = fr
+                flipped.add(new_key)
         if base:
             src_dir, mirror = direction, False
             if direction not in base and MIRROR_OF.get(direction) in base:
@@ -436,11 +493,18 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             entry = parts[k].get(0) or parts[k][min(parts[k])]
             return -offsets[entry[0]][1] < RAISED_Y
 
+        side_raised = {"L": any(raised(k) for k in parts if k[0] in LEFT_ARM),
+                       "R": any(raised(k) for k in parts if k[0] in RIGHT_ARM)}
+
+        def zi(t):   # orden dentro de un mismo grupo: mano < manga < manga de abrigo
+            return Z_ORDER.index(t) / 100 if t in Z_ORDER else 0.5
+
         def z(k, far=far, near=near):
-            if raised(k) and (k[0] in near or front_all):
-                return len(Z_ORDER) - 0.5   # brazo levantado cercano: delante de la cabeza
+            side = "L" if k[0] in LEFT_ARM else "R" if k[0] in RIGHT_ARM else None
+            if side and side_raised[side] and (k[0] in near or front_all):
+                return len(Z_ORDER) - 0.5 + zi(k[0])   # brazo levantado cercano: delante de la cabeza, entero
             if k[0] in far:
-                return -1   # brazo lejano: detrás del torso
+                return -1 + zi(k[0])   # brazo lejano: detrás del torso (mano < manga)
             return Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER)
 
         order = sorted(parts, key=lambda k: (z(k), k[1], k[0]))
