@@ -364,6 +364,8 @@ def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list
         idxs = [i for i, k in enumerate(keys) if k[0] in side and k[0] in far]
         if not idxs or not any(raised(keys[i]) for i in idxs):
             continue
+        if any(k[0] in ("ls", "rs", "lc", "rc") and k[0] in side and k[1] // 100000 != 0 for k in keys):
+            continue   # con manga de una prenda: el brazo queda oculto detrás de la cabeza y el cuerpo, como en el juego
         own = Image.new("L", size, 0)
         for i in idxs:
             im, x, y = placed[i]
@@ -385,44 +387,6 @@ def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list
 
 
 _OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
-
-
-def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list:
-    """
-    Un brazo lejano levantado (p. ej. la mano que bebe) que queda tapado casi del todo por lo que se dibuja
-    después no se vería nunca: se dibuja delante. Los brazos lejanos que cuelgan se dejan detrás.
-    """
-    if not far or len(placed) < 2:
-        return placed
-    x0 = min(x for _i, x, _y in placed)
-    y0 = min(y for _i, _x, y in placed)
-    size = (max(x + i.width for i, x, _y in placed) - x0, max(y + i.height for i, _x, y in placed) - y0)
-
-    def mask_of(img):
-        return img.getchannel("A").point(lambda a: 255 if a > ALPHA_MIN else 0)
-
-    front = []
-    for idx, key in enumerate(keys):
-        if key[0] not in far or not raised(key):
-            continue
-        img, x, y = placed[idx]
-        own = Image.new("L", size, 0)
-        own.paste(mask_of(img), (x - x0, y - y0))
-        visible = own.histogram()[255]
-        if visible < 6:
-            continue
-        later = Image.new("L", size, 0)
-        for j in range(idx + 1, len(placed)):
-            if j in front:
-                continue
-            im2, x2, y2 = placed[j]
-            later.paste(255, (x2 - x0, y2 - y0), mask_of(im2))
-        covered = ImageChops.multiply(own, later).histogram()[255]
-        if covered / visible >= HIDDEN_RATIO:
-            front.append(idx)
-    if not front:
-        return placed
-    return [p for i, p in enumerate(placed) if i not in front] + [placed[i] for i in front]
 
 
 def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
@@ -454,7 +418,15 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             for key, fr in dirs[src_same].items():
                 ptype = SWAP_LR.get(key[0], key[0])
                 new_key = (ptype, key[1])
-                if new_key in parts or ptype.startswith("pt") or key[1] // 100000 in libs_here:
+                if new_key in parts or ptype.startswith("pt"):
+                    continue
+                lib = key[1] // 100000
+                side = LEFT_ARM if ptype in LEFT_ARM else RIGHT_ARM if ptype in RIGHT_ARM else None
+                # (a) la lib no trae nada propio en esta dirección, o
+                # (b) otra lib (p. ej. la prenda) ya usa ese brazo en esta dirección: el personaje debe seguir su pose
+                other_uses_side = side is not None and any(
+                    k[0] in side and k[1] // 100000 != lib for k in own)
+                if lib in libs_here and not other_uses_side:
                     continue
                 parts[new_key] = fr
                 flipped.add(new_key)
@@ -499,11 +471,26 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         def zi(t):   # orden dentro de un mismo grupo: mano < manga < manga de abrigo
             return Z_ORDER.index(t) / 100 if t in Z_ORDER else 0.5
 
+        def width_of(k):
+            entry = parts[k].get(0) or parts[k][min(parts[k])]
+            try:
+                return decoders[entry[1]]().width
+            except Exception:
+                return 0
+
+        # Si la lib trae el brazo lejano casi tan ancho como el cercano (no recortado, como en una armadura),
+        # no es un trocito que asoma detrás del torso: se dibuja como el resto de piezas.
+        complete_far = {}
+        for lib in {k[1] // 100000 for k in parts if k[0] in ARM_TYPES}:
+            fw = max([width_of(k) for k in parts if k[1] // 100000 == lib and k[0] in far] or [0])
+            nw = max([width_of(k) for k in parts if k[1] // 100000 == lib and k[0] in near] or [0])
+            complete_far[lib] = fw >= 3 and nw >= 3 and fw >= 0.65 * nw
+
         def z(k, far=far, near=near):
             side = "L" if k[0] in LEFT_ARM else "R" if k[0] in RIGHT_ARM else None
             if side and side_raised[side] and (k[0] in near or front_all):
                 return len(Z_ORDER) - 0.5 + zi(k[0])   # brazo levantado cercano: delante de la cabeza, entero
-            if k[0] in far:
+            if k[0] in far and not (complete_far.get(k[1] // 100000) and not (side and side_raised[side])):
                 return -1 + zi(k[0])   # brazo lejano: detrás del torso (mano < manga)
             return Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER)
 
