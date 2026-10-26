@@ -272,7 +272,7 @@ def read_swf(data: bytes):
 # Nombre de cada imagen de ropa: h_<acción>_<tipo>_<id>_<dirección>_<frame>
 ASSET_RE = re.compile(r"h_([a-z]+)_([a-z]+)_(\d+)_(\d)_(\d+)$")
 # Orden de dibujo aproximado por tipo de pieza (de atrás hacia delante)
-Z_ORDER = ["hrb", "bd", "lg", "sh", "ch", "cc", "ca", "lh", "rh", "ls", "rs", "lc", "rc", "wa", "cp",
+Z_ORDER = ["pt", "hrb", "bd", "lg", "sh", "ch", "cc", "ca", "lh", "rh", "ls", "rs", "lc", "rc", "wa", "cp",
            "hd", "fc", "ey", "ea", "fa", "hr", "he", "ha"]
 BG = (200, 202, 208, 255)
 
@@ -415,18 +415,27 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             # Solo para las libs (personaje o prenda) que no traen NINGUNA pieza propia en esta dirección;
             # si traen alguna, el resto de sus piezas se completa desde "de pie".
             libs_here = {k[1] // 100000 for k in own}
+            # Estado simétrico (p. ej. cargar con los dos brazos): los dos brazos son visibles en la dirección
+            # de origen, así que el brazo que falta se obtiene espejando el otro. Los marcadores de 1 px no cuentan.
+            sides_visible = {}
+            for key, fr in dirs[src_same].items():
+                side = "L" if key[0] in LEFT_ARM else "R" if key[0] in RIGHT_ARM else None
+                if side:
+                    entry = fr.get(0) or fr[min(fr)]
+                    try:
+                        if _visible_pixels(decoders[entry[1]]()) >= 4:
+                            sides_visible.setdefault(key[1] // 100000, set()).add(side)
+                    except Exception:
+                        pass
+            symmetric = {lib for lib, sd in sides_visible.items() if len(sd) == 2}
             for key, fr in dirs[src_same].items():
                 ptype = SWAP_LR.get(key[0], key[0])
                 new_key = (ptype, key[1])
                 if new_key in parts or ptype.startswith("pt"):
                     continue
                 lib = key[1] // 100000
-                side = LEFT_ARM if ptype in LEFT_ARM else RIGHT_ARM if ptype in RIGHT_ARM else None
-                # (a) la lib no trae nada propio en esta dirección, o
-                # (b) otra lib (p. ej. la prenda) ya usa ese brazo en esta dirección: el personaje debe seguir su pose
-                other_uses_side = side is not None and any(
-                    k[0] in side and k[1] // 100000 != lib for k in own)
-                if lib in libs_here and not other_uses_side:
+                is_arm = ptype in ARM_TYPES
+                if lib in libs_here and not (is_arm and lib in symmetric):
                     continue
                 parts[new_key] = fr
                 flipped.add(new_key)
@@ -484,7 +493,7 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         for lib in {k[1] // 100000 for k in parts if k[0] in ARM_TYPES}:
             fw = max([width_of(k) for k in parts if k[1] // 100000 == lib and k[0] in far] or [0])
             nw = max([width_of(k) for k in parts if k[1] // 100000 == lib and k[0] in near] or [0])
-            complete_far[lib] = fw >= 3 and nw >= 3 and fw >= 0.65 * nw
+            complete_far[lib] = (action in ("std", "sit", "wlk") and fw >= 3 and nw >= 3 and fw >= 0.65 * nw)
 
         def z(k, far=far, near=near):
             side = "L" if k[0] in LEFT_ARM else "R" if k[0] in RIGHT_ARM else None
