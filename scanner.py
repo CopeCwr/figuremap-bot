@@ -308,6 +308,7 @@ RIGHT_ARM = {"rs", "rc", "rh"}
 ARM_TYPES = LEFT_ARM | RIGHT_ARM
 RAISED_Y = -52      # un brazo cuya parte superior queda por encima de esta altura está levantado (junto a la cabeza)
 HIDDEN_RATIO = 0.85  # un brazo lejano levantado que queda tapado casi del todo se dibuja delante
+MIRROR_FULL = {"drk"}   # beber: las direcciones 4, 5 y 6 se muestran como espejo exacto de 2, 1 y 0
 MIRROR_OF = {4: 2, 5: 1, 6: 0}   # direcciones que Habbo dibuja como espejo de otra
 MIRROR_AXIS2 = 67                # 2 x el eje central del avatar (x ≈ 33,5)
 LAY_SHIFT = (-64, -160)   # esas piezas usan otro origen: con este ajuste coinciden con la pose "lay"
@@ -406,11 +407,19 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
     for direction in sorted(dirs):
         if skip_dirs and (action, direction) in skip_dirs:
             continue
-        parts = dict(dirs[direction])
-        own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
-        flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
         src_same = MIRROR_OF.get(direction)
-        if src_same in dirs:
+        full_mirror = (action in MIRROR_FULL and src_same in dirs
+                       and not any(k[0].startswith("pt") for k in dirs[src_same]))
+        if full_mirror:
+            # el estado completo en 4, 5 y 6 = espejo de 2, 1 y 0 (izquierda <-> derecha), incluidas las prendas
+            parts = {(SWAP_LR.get(k[0], k[0]), k[1]): fr for k, fr in dirs[src_same].items()}
+            own = set(parts)
+            flipped = set(parts)
+        else:
+            parts = dict(dirs[direction])
+            own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
+            flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
+        if src_same in dirs and not full_mirror:
             # Habbo dibuja 4, 5 y 6 como espejo de 2, 1 y 0 del MISMO estado (izquierda <-> derecha).
             # Solo para las libs (personaje o prenda) que no traen NINGUNA pieza propia en esta dirección;
             # si traen alguna, el resto de sus piezas se completa desde "de pie".
@@ -468,11 +477,35 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
         near = NEAR_TYPES.get(direction, ())
         front_all = direction in (3, 7)   # de frente y de espaldas no hay lado cercano: todo brazo levantado va delante
 
+        def box_of(k):
+            entry = parts[k].get(0) or parts[k][min(parts[k])]
+            ox, oy = offsets[entry[0]]
+            try:
+                w, h = decoders[entry[1]]().size
+            except Exception:
+                return None
+            x = (MIRROR_AXIS2 - (-ox) - w) if k in flipped else -ox
+            return (x, -oy, x + w, -oy + h)
+
+        head_boxes = [b for b in (box_of(k) for k in parts if k[0] == "hd") if b]
+        head_box = ((min(b[0] for b in head_boxes), min(b[1] for b in head_boxes),
+                     max(b[2] for b in head_boxes), max(b[3] for b in head_boxes)) if head_boxes else None)
+
         def raised(k):
+            """Brazo levantado: su parte superior sube de la altura del cuello o tapa buena parte de la cabeza."""
             if k[0] not in ARM_TYPES:
                 return False
-            entry = parts[k].get(0) or parts[k][min(parts[k])]
-            return -offsets[entry[0]][1] < RAISED_Y
+            b = box_of(k)
+            if b is None:
+                return False
+            if b[1] < RAISED_Y:
+                return True
+            if head_box:
+                ow = min(b[2], head_box[2]) - max(b[0], head_box[0])
+                oh = min(b[3], head_box[3]) - max(b[1], head_box[1])
+                area = max(1, (b[2] - b[0]) * (b[3] - b[1]))
+                return ow > 0 and oh > 0 and ow * oh / area >= 0.25
+            return False
 
         side_raised = {"L": any(raised(k) for k in parts if k[0] in LEFT_ARM),
                        "R": any(raised(k) for k in parts if k[0] in RIGHT_ARM)}
@@ -501,6 +534,8 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                 return len(Z_ORDER) - 0.5 + zi(k[0])   # brazo levantado cercano: delante de la cabeza, entero
             if k[0] in far and not (complete_far.get(k[1] // 100000) and not (side and side_raised[side])):
                 return -1 + zi(k[0])   # brazo lejano: detrás del torso (mano < manga)
+            if k[0] == "pt" and action == "sit":
+                return Z_ORDER.index("sh") + 0.5   # en el regazo: encima de las rodillas, bajo el torso y los brazos
             return Z_ORDER.index(k[0]) if k[0] in Z_ORDER else len(Z_ORDER)
 
         order = sorted(parts, key=lambda k: (z(k), k[1], k[0]))
