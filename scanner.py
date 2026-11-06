@@ -272,8 +272,8 @@ def read_swf(data: bytes):
 # Nombre de cada imagen de ropa: h_<acción>_<tipo>_<id>_<dirección>_<frame>
 ASSET_RE = re.compile(r"h_([a-z]+)_([a-z]+)_(\d+)_(\d)_(\d+)$")
 # Orden de dibujo aproximado por tipo de pieza (de atrás hacia delante)
-Z_ORDER = ["pt", "hrb", "bd", "lg", "sh", "ch", "cc", "ca", "lh", "rh", "ls", "rs", "lc", "rc", "wa", "cp",
-           "hd", "fc", "ey", "ea", "fa", "hr", "he", "ha"]
+Z_ORDER = ["mcu", "pt", "hrb", "bd", "lg", "sh", "ch", "cc", "ca", "lh", "rh", "ls", "rs", "lc", "rc", "wa", "cp",
+           "hd", "fc", "ey", "ea", "fa", "hr", "he", "ha", "mco"]
 BG = (200, 202, 208, 255)
 
 
@@ -467,8 +467,6 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                         continue
                 if fill_types is not None and ptype not in fill_types:
                     continue
-                if action == "sit" and ptype in ("lc", "rc", "ca") and any(t == "cc" for t, _ in own):
-                    continue                               # abrigo sentado: el cc ya trae su propia forma
                 parts[new_key] = {0: fr[0] if 0 in fr else fr[min(fr)]}  # pieza fija (frame 0)
                 if mirror:
                     flipped.add(new_key)
