@@ -343,7 +343,33 @@ def _collect_views(decoders: dict, offsets: dict) -> dict:
     return views
 
 
-_OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
+
+
+CANVAS_X = (-30, 130)    # el personaje cabe en este rango; una pieza totalmente fuera es un offset corrupto
+CANVAS_Y = (-140, 50)
+OUTLIER_MARGIN = 45   # px: una pieza de prenda más lejos que esto del cuerpo del personaje se considera defectuosa
+
+
+def _drop_outliers(placed: list, keys: list):
+    """
+    Descarta piezas de prendas colocadas muy lejos del personaje (p. ej. un bastón con offset corrupto en el
+    .swf, a 80 px a la izquierda y 60 px por debajo). Solo actúa si el personaje base está presente.
+    """
+    core = [(x, y, x + i.width, y + i.height) for (i, x, y), k in zip(placed, keys)
+            if k[1] // 100000 == 0 and k[0] in ("bd", "hd")]
+    if not core:
+        return placed, keys
+    cx0, cy0 = min(b[0] for b in core) - OUTLIER_MARGIN, min(b[1] for b in core) - OUTLIER_MARGIN
+    cx1, cy1 = max(b[2] for b in core) + OUTLIER_MARGIN, max(b[3] for b in core) + OUTLIER_MARGIN
+    kept_p, kept_k = [], []
+    for (img, x, y), k in zip(placed, keys):
+        far = (x + img.width < cx0 or x > cx1 or y + img.height < cy0 or y > cy1)
+        if far and k[1] // 100000 != 0 and _visible_pixels(img) >= 4:
+            print(f"  aviso: pieza {k[0]} fuera de lugar en '{_CTX.get('action')} {_CTX.get('dir')}' "
+                  f"(x {x}..{x + img.width}, y {y}..{y + img.height}): omitida", file=sys.stderr)
+            continue
+        kept_p.append((img, x, y)); kept_k.append(k)
+    return kept_p, kept_k
 
 
 def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list:
@@ -388,6 +414,7 @@ def _bring_hidden_arms_front(placed: list, keys: list, far: set, raised) -> list
 
 
 _OMITTED = []   # (estado, dirección) de las vistas defectuosas detectadas
+_CTX = {}       # estado y dirección en curso (solo para diagnóstico)
 
 
 def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dict = None, shift=(0, 0),
@@ -407,6 +434,7 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
     for direction in sorted(dirs):
         if skip_dirs and (action, direction) in skip_dirs:
             continue
+        _CTX["action"], _CTX["dir"] = action, direction
         src_same = MIRROR_OF.get(direction)
         full_mirror = (action in MIRROR_FULL and src_same in dirs
                        and not any(k[0].startswith("pt") for k in dirs[src_same]))
@@ -416,7 +444,21 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             own = set(parts)
             flipped = set(parts)
         else:
-            parts = dict(dirs[direction])
+            parts = {}
+            for k, fr in dirs[direction].items():
+                entry = fr.get(0) or fr[min(fr)]
+                ox, oy = offsets[entry[0]]
+                try:
+                    im0 = decoders[entry[1]]()
+                    w0, h0 = im0.size
+                    broken = (-ox + w0 < CANVAS_X[0] or -ox > CANVAS_X[1] or -oy + h0 < CANVAS_Y[0] or -oy > CANVAS_Y[1])
+                    if broken and _visible_pixels(im0) >= 4:
+                        print(f"  aviso: pieza {k[0]} con offset corrupto en '{action} {direction}': se espeja la otra dirección",
+                              file=sys.stderr)
+                        continue
+                except Exception:
+                    pass
+                parts[k] = fr
             own = set(parts)  # piezas propias del estado (las demás se completan desde la base)
             flipped = set()   # piezas de la base que hay que espejar (direcciones 4, 5 y 6)
         if src_same in dirs and not full_mirror:
@@ -459,6 +501,16 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                 new_key = (ptype, key[1])
                 if new_key in parts:                       # el estado ya trae esta pieza exacta (tipo + id)
                     continue
+                if ptype in ("mcl", "mcr"):
+                    # Objeto en la mano: si el estado ya lo trae visible en la otra mano, no se duplica
+                    other = ("mcr" if ptype == "mcl" else "mcl", key[1])
+                    if other in parts:
+                        entry = parts[other].get(0) or parts[other][min(parts[other])]
+                        try:
+                            if _visible_pixels(decoders[entry[1]]()) >= 4:
+                                continue
+                        except Exception:
+                            pass
                 if ptype in ("ptl", "ptr"):
                     # Mascota que alterna de lado (ptl <-> ptr): si el estado trae el lado contrario y la base
                     # no lo tiene, son la misma mascota y no se duplica (el fantasma tiene ambos lados: no aplica).
@@ -527,6 +579,8 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
             complete_far[lib] = (action in ("std", "sit", "wlk") and fw >= 3 and nw >= 3 and fw >= 0.65 * nw)
 
         def z(k, far=far, near=near):
+            if k[0] == "mcu" or (k[0] == "pt" and action != "sit"):
+                return -5   # objeto/mascota "por debajo": detrás de todo, incluso de los brazos lejanos
             side = "L" if k[0] in LEFT_ARM else "R" if k[0] in RIGHT_ARM else None
             if side and side_raised[side] and (k[0] in near or front_all):
                 return len(Z_ORDER) - 0.5 + zi(k[0])   # brazo levantado cercano: delante de la cabeza, entero
@@ -558,6 +612,7 @@ def _build_row(action: str, dirs: dict, decoders: dict, offsets: dict, base: dic
                 placed.append((img, -ox + dx, -oy + dy))  # esquina superior izquierda = (-offset)
                 placed_keys.append(key)
             if placed:
+                placed, placed_keys = _drop_outliers(placed, placed_keys)
                 placed = _bring_hidden_arms_front(placed, placed_keys, far, raised)
                 composed.append(placed)
         if not composed:
@@ -817,14 +872,65 @@ def is_full_character(decoders: dict) -> bool:
     return False
 
 
-def build_lib_previews(decoders: dict, offsets: dict, base_url: str) -> list:
+GENDER_RE = re.compile(r"^(?P<pre>.+?)_(?P<g>[UFM])_(?P<rest>.+)$")   # p. ej. jacket_F_nftsnowstorm
+SLEEVE_TYPES = ("ls", "rs", "lc", "rc")
+
+
+def has_std_sleeves(decoders: dict) -> bool:
+    """¿La lib trae mangas visibles en la pose de pie?"""
+    for name, fn in decoders.items():
+        m = ASSET_RE.search(name)
+        if m and m.group(1) == "std" and m.group(2) in SLEEVE_TYPES:
+            try:
+                if _visible_pixels(fn()) >= 4:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+def wears_on_torso(decoders: dict) -> bool:
+    return any((m := ASSET_RE.search(n)) and m.group(1) == "std" and m.group(2) in ("ch", "cc") for n in decoders)
+
+
+def find_sleeve_sibling(lib_name: str, decoders: dict, base_url: str):
+    """
+    Una prenda de torso sin mangas puede tomarlas de su variante de otro género (jacket_F_x <-> jacket_M_x),
+    porque en el juego ambas comparten las mismas mangas. Devuelve (decoders, offsets) solo con las mangas, o None.
+    """
+    m = GENDER_RE.match(lib_name or "")
+    if not m or has_std_sleeves(decoders) or not wears_on_torso(decoders):
+        return None
+    for g in "MFU":
+        if g == m.group("g"):
+            continue
+        try:
+            r = requests.get(f"{base_url}{m.group('pre')}_{g}_{m.group('rest')}.swf", headers=HEADERS, timeout=60)
+            if r.status_code != 200 or len(r.content) > MAX_SWF_BYTES:
+                continue
+            sib_dec, sib_off = read_swf(r.content)
+        except Exception as exc:
+            print(f"  no se pudo leer la variante {g}: {exc}", file=sys.stderr)
+            continue
+        if has_std_sleeves(sib_dec):
+            only = {n: fn for n, fn in sib_dec.items() if (mm := ASSET_RE.search(n)) and mm.group(2) in SLEEVE_TYPES}
+            print(f"  mangas tomadas de {m.group('pre')}_{g}_{m.group('rest')}")
+            return only, sib_off
+    return None
+
+
+def build_lib_previews(decoders: dict, offsets: dict, base_url: str, lib_name: str = None) -> list:
     """Vista por defecto de una prenda: puesta sobre el personaje (o sola si es una piel o no hay personaje)."""
     if not offsets:
         return []
     character = None if is_full_character(decoders) else get_character(base_url)
     if character:
         try:
-            result = dressed_previews([character, (decoders, offsets)], all_states=True)
+            libs = [character, (decoders, offsets)]
+            sleeves = find_sleeve_sibling(lib_name, decoders, base_url)
+            if sleeves:
+                libs.append(sleeves)
+            result = dressed_previews(libs, all_states=True)
             if result:
                 return result
         except Exception as exc:
@@ -887,7 +993,8 @@ def lib_previews(swf_url: str) -> list:
         return []
     result = []
     try:
-        result = build_lib_previews(decoders, offsets, swf_url.rsplit("/", 1)[0] + "/")
+        lib_name = swf_url.rsplit("/", 1)[1][:-4]
+        result = build_lib_previews(decoders, offsets, swf_url.rsplit("/", 1)[0] + "/", lib_name)
     except Exception as exc:
         print(f"  error armando la prenda: {exc}", file=sys.stderr)
     if result:
