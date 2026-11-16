@@ -53,7 +53,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; HabboFiguremapBot/1.0)"}
 TIMEOUT = 30
 MAX_SWF_BYTES = 40 * 1024 * 1024
 MAX_IMAGES_IN_SHEET = 24
-MAX_PREVIEWS = 30            # máx. prendas con imagen por ejecución (el resto, solo texto)
+MAX_PREVIEWS = 100           # máx. prendas con imagen por ejecución (el resto, solo texto)
 MAX_PNG_BYTES = 8 * 1024 * 1024
 MIME = {"png": "image/png", "gif": "image/gif", "webp": "image/webp"}
 
